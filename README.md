@@ -1,151 +1,235 @@
-# CSRF-Aware Brute Force Engine
+# CSRF-Aware Brute Force Engine v2.1
 
 > **⚠️ AUTHORIZED PENETRATION TESTING USE ONLY**
-> Unauthorized access to computer systems is illegal under laws including
-> the Computer Fraud and Abuse Act (CFAA), Computer Misuse Act, and equivalent
-> legislation worldwide. Ensure you have **written authorization** before testing.
+> Unauthorized access to computer systems is illegal. Ensure you have **written authorization** before testing.
 
 ## Overview
 
-A Python-based penetration testing tool that bypasses **Anti-CSRF (Cross-Site Request Forgery)** token mechanisms to perform brute-force authentication attacks. Designed for testing **DVWA (Damn Vulnerable Web Application)** and similar CSRF-protected login forms.
+A Python-based penetration testing tool that bypasses **Anti-CSRF (Cross-Site Request Forgery)** token mechanisms to perform brute-force authentication attacks. Designed for **DVWA (Damn Vulnerable Web Application)** and similar CSRF-protected login forms.
 
 ### Framework Alignment
 
 | Framework | Mapping |
 |-----------|---------|
-| **MITRE ATT&CK** | T1110.001 (Brute Force: Password Guessing) |
-| **Cyber Kill Chain** | Phase 5 - Exploitation |
+| **MITRE ATT&CK** | T1110.001 (Brute Force), T1090.002 (Proxy Rotation), T1036.005 (UA Masquerading) |
+| **Cyber Kill Chain** | Phase 5 — Exploitation |
 | **PTES** | Exploitation Phase |
 
 ## Algorithm Architecture
 
-The tool implements a 7-step attack cycle:
-
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  STEP 1: Session Initialization (PHPSESSID binding)     │
+│  STEP 1: Session Init (PHPSESSID binding)               │
 │  ↓                                                      │
-│  STEP 2: GET Request (Fetch login page HTML)       ←──┐ │
+│  STEP 2: GET Request (fetch login page HTML)       ←──┐ │
 │  ↓                                                    │ │
-│  STEP 3: DOM Parsing (Extract CSRF token via regex)   │ │
+│  STEP 3: DOM Parse (extract CSRF token via regex)     │ │
 │  ↓                                                    │ │
-│  STEP 4: Payload Construction (creds + token + form)  │ │
+│  STEP 4: Payload Build (creds + token + form params)  │ │
 │  ↓                                                    │ │
-│  STEP 5: POST Execution + Evasion (jitter, UA rot.)   │ │
+│  STEP 5: Execute + Evasion (jitter, UA, proxy rot.)   │ │
 │  ↓                                                    │ │
-│  STEP 6: Response Analysis (status code + body scan)  │ │
+│  STEP 6: Response Analysis (status + body scan)       │ │
 │  ↓                                                    │ │
 │  STEP 7: Reset token → Loop back to Step 2 ──────────┘ │
-│  (Token is single-use nonce, must re-fetch each cycle)  │
+│  (Token is single-use nonce, MUST re-fetch each cycle)  │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
 
 ```bash
-# Only dependency: requests
+# Only dependency
 pip install requests
 ```
 
-## Usage
+## Quick Start
 
-### Basic DVWA Attack
+### DVWA Brute Force Page (Low/Medium/High Security)
 
-```bash
-python3 csrf_brute.py -t http://192.168.1.100 -u admin -w wordlists/sample.txt
-```
-
-### With Proxy (Burp Suite)
+The DVWA brute force page uses **GET method**. This is the default:
 
 ```bash
 python3 csrf_brute.py \
-    -t http://192.168.1.100 \
+    -t http://192.168.1.100/vulnerabilities/brute/ \
+    -u admin \
+    -w wordlists/sample.txt
+```
+
+### DVWA Main Login Page (`/login.php`)
+
+The login page uses **POST method**. Specify with `-m POST`:
+
+```bash
+python3 csrf_brute.py \
+    -t http://192.168.1.100/login.php \
     -u admin \
     -w wordlists/sample.txt \
-    --proxy http://127.0.0.1:8080 \
-    -v
+    -m POST
 ```
 
-### Maximum Stealth Mode
+### DVWA Impossible Mode (Lockout Bypass with Proxy Rotation)
+
+The Impossible level locks accounts after 3 failed attempts per IP.
+Use `--proxy-list` to rotate source IPs:
 
 ```bash
 python3 csrf_brute.py \
-    -t http://192.168.1.100 \
+    -t http://192.168.1.100/vulnerabilities/brute/ \
+    -u admin \
+    -w wordlists/sample.txt \
+    --proxy-list proxies.txt \
+    --lockout-after 2
+```
+
+### Custom Application
+
+```bash
+python3 csrf_brute.py \
+    -t http://target.local/auth/login \
     -u admin \
     -w /usr/share/wordlists/rockyou.txt \
-    --jitter-min 3.0 \
-    --jitter-max 10.0 \
-    -o results.txt
+    -m POST \
+    --token-name csrf_token \
+    --failure "Invalid credentials"
 ```
 
-### Custom Form Parameters
+### With Burp Suite Proxy + Verbose
 
 ```bash
 python3 csrf_brute.py \
-    -t http://target.local \
-    -u administrator \
-    -w passwords.txt \
-    --token-name csrf_token \
-    --failure "Invalid credentials" \
-    -p /login
+    -t http://192.168.1.100/vulnerabilities/brute/ \
+    -u admin \
+    -w wordlists/sample.txt \
+    --proxy http://127.0.0.1:8080 -v
 ```
 
-## CLI Options
+### Maximum Stealth
+
+```bash
+python3 csrf_brute.py \
+    -t http://target/login \
+    -u admin \
+    -w wordlists/sample.txt \
+    --jitter-min 3.0 --jitter-max 10.0
+```
+
+## CLI Reference
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-t, --target` | Target base URL | *required* |
+| `-t, --target` | **Full** target URL to attack | *required* |
 | `-u, --username` | Target username | *required* |
-| `-w, --wordlist` | Password wordlist path | *required* |
-| `-p, --path` | Login endpoint path | `/vulnerabilities/brute/` |
+| `-w, --wordlist` | Password wordlist file path | *required* |
+| `-m, --method` | HTTP method: `GET` or `POST` | `GET` |
 | `--token-name` | CSRF token field name | `user_token` |
-| `--failure` | Failure indicator string | `Login failed` |
-| `--success-path` | Success redirect path | `/dashboard` |
+| `--failure` | Failure indicator string | `Username and/or password incorrect` |
+| `--success-path` | Redirect path for success detection | `/dashboard` |
 | `--jitter-min` | Min delay between requests (seconds) | `0.5` |
 | `--jitter-max` | Max delay between requests (seconds) | `2.0` |
-| `--no-ua-rotate` | Disable User-Agent rotation | `false` |
-| `--proxy` | HTTP proxy URL | `None` |
-| `-o, --output` | Output results file | `None` |
-| `-v, --verbose` | Enable debug output | `false` |
+| `--no-ua-rotate` | Disable User-Agent rotation | off |
+| `--proxy` | Single HTTP proxy URL | None |
+| `--proxy-list` | Proxy list file for IP rotation | None |
+| `--lockout-after` | Rotate proxy after N attempts | `2` |
+| `-o, --output` | File to append cracked credentials | None |
+| `-v, --verbose` | Show step-level debug output | off |
 
-## OpSec Features
+## Key Concepts
 
-### User-Agent Rotation (T1036.005)
-Randomly selects from 7 legitimate browser User-Agent strings per request to defeat signature-based detection and simple fingerprinting.
+### Why GET, Not POST?
 
-### Request Jitter (Rate-Limit Evasion)
-Introduces randomized delays between requests using a configurable range. This prevents triggering SOC/SIEM rate-limit alarms and makes traffic appear more organic.
+The DVWA brute force page (`/vulnerabilities/brute/`) uses `<form method="GET">`. The credentials are sent as **URL query parameters**, not in the POST body. Using POST against this page means the server completely ignores the payload — it never sees your login attempt.
 
-### Referer Header Spoofing
-Automatically sets the `Referer` header to the login page URL, mimicking the natural browser navigation flow of a user submitting a form.
+| DVWA Page | HTTP Method | Usage |
+|-----------|-------------|-------|
+| `/vulnerabilities/brute/` | **GET** | `-m GET` (default) |
+| `/login.php` | **POST** | `-m POST` |
 
-### Proxy Support
-Routes traffic through an HTTP proxy (e.g., Burp Suite at `127.0.0.1:8080`) for traffic inspection, modification, and replay capabilities.
+### Token Handling — 100% Dynamic & Automated
+
+The CSRF token (`user_token`) is **never static or hardcoded**. Every single iteration:
+
+1. **GET** → Fresh HTML fetched from the server
+2. **Regex** → New `user_token` nonce extracted from `<input type="hidden">`
+3. **Inject** → Token placed into the payload alongside credentials
+4. **Consume** → Server validates and invalidates the token
+5. **Discard** → Old token deleted from memory, loop restarts at step 1
+
+You never need to manually handle tokens. The automation handles the full CSRF bypass cycle.
+
+### Proxy Rotation — Impossible Mode Lockout Bypass
+
+DVWA's Impossible level implements per-IP account lockout after 3 failed attempts (15-minute cooldown). The `ProxyPool` class defeats this by:
+
+1. Loading proxies from `proxies.txt`
+2. Randomizing the pool order (OpSec)
+3. Tracking attempts per proxy
+4. Rotating to the next proxy after `--lockout-after` attempts
+5. Re-initializing the HTTP session with the new source IP
+6. Marking dead/unreachable proxies and removing them from rotation
+
+**Sources for fresh proxies:**
+
+```bash
+# Free proxy API (elite anonymity, HTTP)
+curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite" > proxies.txt
+
+# TOR (local SOCKS5)
+echo "socks5://127.0.0.1:9050" > proxies.txt
+
+# For serious engagements: use a VPS fleet or residential proxy service
+```
+
+### Terminal UI
+
+The output uses rich ANSI colors:
+
+- **` PASS  `** (red background) — Failed login attempt
+- **` FOUND `** (green background) — Cracked credential!
+- Progress bar with `█░` fill and percentage
+- Box-drawn summary table on exit
+- Proxy address shown per attempt when using pool rotation
+
+### Exit Summary
+
+On **any** exit condition — success, Ctrl+C, or wordlist exhaustion — the tool prints a session summary including:
+
+- Total attempts, duration, request rate
+- **🔓 CRACKED CREDENTIALS** section with all caught logins
+- Timestamps and attempt numbers for each crack
 
 ## Project Structure
 
 ```
 brute/
-├── csrf_brute.py          # Main attack engine (7-step algorithm)
+├── csrf_brute.py          # Main engine (all 7 algorithm steps)
+├── proxies.txt            # Proxy list template (for lockout bypass)
 ├── wordlists/
-│   └── sample.txt         # Sample wordlist for DVWA testing
+│   └── sample.txt         # Sample wordlist (includes DVWA default)
 └── README.md              # This file
 ```
 
-## Why CSRF Tokens Require Per-Request Refresh
+## Version History
 
-CSRF tokens in secure implementations are **single-use cryptographic nonces**:
+### v2.1 (Current)
+- **Fixed**: DVWA brute page uses GET, not POST — added `-m/--method` flag
+- **Fixed**: Default failure string now matches DVWA's actual response
+- **Added**: Proxy rotation via `--proxy-list` for Impossible mode lockout bypass
+- **Added**: `--lockout-after` threshold control
 
-1. Server generates a unique token and binds it to the current session
-2. Token is embedded in the HTML form as a hidden input field
-3. When the form is submitted, the server validates and **consumes** the token
-4. The consumed token is **invalidated** — it cannot be reused
+### v2.0
+- Full URL flexibility (`-t` accepts complete URL, no static path appending)
+- Rich colorized terminal output (PASS/FOUND indicators, progress bar)
+- Results cache with summary table on exit
+- Graceful Ctrl+C with credential summary
+- Signal-safe loop control
 
-This is why the tool must perform a **full GET → Extract → POST cycle** for every
-password attempt, rather than simply reusing a single token for all requests.
+### v1.0
+- Initial implementation of 7-step CSRF bypass algorithm
+- Session management, token extraction, payload construction
+- User-Agent rotation and jitter evasion
 
 ## Legal Notice
 
 This tool is provided for **educational and authorized security testing purposes only**.
-The authors are not responsible for misuse or damage caused by this tool.
-Always obtain proper authorization before conducting any penetration testing activities.
+The authors are not responsible for misuse. Always obtain proper authorization.
