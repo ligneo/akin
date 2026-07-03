@@ -1,0 +1,8 @@
+# DVWA brute-force 
+python3 csrf_brute.py -t http://localhost/vulnerabilities/brute/ -u admin -w wordlists/sample.txt
+
+# DVWA 
+python3 csrf_brute.py -t http://localhost/login.php -u admin -w wordlists/sample.txt
+
+# SHRUG
+python3 csrf_brute.py -t http://target.local/auth/login -u admin -w wordlists/sample.txt
