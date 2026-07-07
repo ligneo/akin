@@ -523,6 +523,14 @@ def init_session(
         )
 
     if security_level:
+        # CRITICAL: DVWA sets 'security=impossible' as a server cookie on
+        # initial page load. We must REMOVE the old cookie first before
+        # setting our desired level, otherwise requests sends BOTH cookies
+        # and the server's 'impossible' takes precedence.
+        # Clear any existing 'security' cookies from the jar
+        to_remove = [c for c in session.cookies if c.name == "security"]
+        for c in to_remove:
+            session.cookies.clear(c.domain, c.path, c.name)
         session.cookies.set("security", security_level)
         print(
             f"  {C.CYAN}[STEP 1]{C.RST} DVWA security level → "
