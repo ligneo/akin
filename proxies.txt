@@ -1,0 +1,36 @@
+# ============================================================
+# Free HTTP Proxy List — For Penetration Testing Use Only
+# ============================================================
+# Format: protocol://ip:port  (one per line)
+# Lines starting with # are comments
+#
+# IMPORTANT: Free proxies are unreliable and short-lived.
+# For serious engagements, use:
+#   - Your own VPS fleet (DigitalOcean, Vultr, Linode)
+#   - Residential proxy services (Bright Data, Oxylabs)
+#   - TOR SOCKS5 (socks5://127.0.0.1:9050)
+#
+# To fetch fresh free proxies, try:
+#   curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite" > proxies.txt
+#
+# Or use tools like:
+#   - proxychains4
+#   - proxy-scraper (pip install proxy-scraper)
+#
+# Usage with csrf_brute.py:
+#   python3 csrf_brute.py -t http://target/vuln -u admin -w wordlists/sample.txt \
+#       --proxy-list proxies.txt --lockout-after 2
+# ============================================================
+
+# === TOR (if running locally) ===
+# socks5://127.0.0.1:9050
+
+# === Example free proxies (REPLACE with fresh ones) ===
+# These are EXAMPLES and will likely be dead. Fetch fresh proxies
+# using the curl command above before each engagement.
+#
+# http://103.152.112.162:80
+# http://154.26.135.123:3128
+# http://185.199.229.156:7492
+# http://64.225.4.17:9993
+# http://38.242.230.18:8080

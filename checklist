@@ -1,0 +1,92 @@
+1. IP-based counter bypass
+
+ Test with X-Forwarded-For, X-Real-IP, X-Client-IP, True-Client-IP headers spoofed — does the app trust client-supplied headers instead of the actual connection IP?
+ Rotate through a pool of proxies/VPNs/Tor exit nodes — confirm the limit is per-IP and can be trivially distributed.
+ Test IPv6 — many implementations only rate-limit IPv4, or don't account for the fact that a single user can get a fresh /64 or /48 block easily.
+ Check if requests from cloud provider IP ranges (AWS/GCP/Azure elastic IPs) get treated differently or slip through allowlists.
+
+2. Account-based counter bypass
+
+ Test whether the account counter is keyed on exact-match username, or if case variation (User@x.com vs user@x.com), whitespace, or Unicode homoglyphs bypass it.
+ Check email aliasing tricks (user+1@gmail.com, user+2@gmail.com) if the backend treats these as distinct accounts but they resolve to the same mailbox.
+ Confirm the account counter can't be reset by an attacker (e.g., is there an endpoint that clears failed-attempt counts, like a password-reset trigger, that could be abused to reset lockout state mid-attack?).
+
+3. 429 enforcement vs. "soft" throttling
+
+ Confirm the endpoint returns a hard 429 and actually rejects the request (no auth check performed) rather than just delaying and still processing the credential check.
+ Check response timing side-channels: does a throttled response take a measurably different time than a valid "wrong password" response, potentially leaking whether the account exists or is locked?
+ Test whether error messages differ between "rate limited" and "invalid credentials" in a way that helps an attacker distinguish valid usernames (username enumeration).
+
+4. WAF / reverse-proxy layer bypass
+
+ Identify if the app is reachable directly (origin IP exposed), bypassing Cloudflare/WAF entirely — check DNS history, SSL cert transparency logs, error pages leaking origin IP, SSRF-based origin discovery.
+ Test alternate paths to the same endpoint (/login, /Login, /login/, /api/v1/login, /api//login, URL-encoded variants) — does the WAF rule cover all of them or only the canonical path?
+ Test HTTP method variation (POST vs PUT vs malformed methods) and content-type variation (JSON vs form-encoded vs multipart) — some WAF rules only match specific method/content-type combos.
+ Check if the rate limit rule matches on exact hostname — test via alternate Host headers, IP-direct requests with Host header manipulation, or CDN misconfig.
+
+5. Progressive delay logic
+
+ Confirm delay state is tied to account/IP and not resettable by simply waiting slightly under the threshold and retrying in parallel (race condition: fire N concurrent requests before the counter increments/persists).
+ Test for race conditions in the counter increment itself — burst 20-50 concurrent requests and see if more than the allowed number get processed before the limit "catches up" (classic TOCTOU bug in Redis INCR without atomic operations or missing Lua script atomicity).
+ Check if the progressive delay resets after a single success — could an attacker interleave one correct-looking request to reset the backoff counter?
+ Verify the delay is enforced for exactly matching account, or if slight variations (per bypass tests above) each get their own fresh backoff counter.
+
+6. Distributed / credential-stuffing specific
+
+ Test low-and-slow: e.g., 1 request per IP per account but from thousands of distinct IPs against thousands of distinct accounts (classic credential-stuffing pattern) — is there any cross-account/cross-IP correlation detection, or does per-IP/per-account limiting alone miss this entirely?
+ Check whether there's device fingerprinting, TLS fingerprinting (JA3), or behavioral signals supplementing IP/account counters, since IP+account alone is bypassed trivially at scale.
+
+7. Redis-specific implementation checks
+
+ If Redis is used for the counter, check for race conditions from non-atomic GET + INCR pairs instead of atomic INCR/Lua scripting.
+ Test behavior when Redis is unreachable/slow — does the app fail open (allow all requests) or fail closed (block all requests)? Fail-open under load is a common oversight.
+ Check TTL/expiry precision — if the window resets are handled with a fixed calendar-minute boundary (floor(timestamp/60)) rather than a sliding window, an attacker can double their allowed rate by hitting the request right before and right after a minute boundary.
+
+8. General
+
+ Test with automated tools (Burp Intruder, custom scripts) to empirically measure whether the achieved max request rate matches the documented policy.
+ Confirm rate limiting doesn't accidentally enable a DoS vector against legitimate users (e.g., an attacker deliberately failing login attempts against a victim's known username to lock them out — account-based limiting alone can be weaponized this way; check if there's a lockout-vs-throttle distinction and CAPTCHA fallback instead of full lockout).
+
+
+
+2. Account Lockout
+
+ Lockout scope confusion: Verify lockout is truly account-based — test if creating slight variations of the target username (case, whitespace, Unicode homoglyphs, email aliasing with +tag) resets the failed-attempt counter and avoids lockout entirely.
+ Timestamp-based unlock manipulation: If lockout uses last_failed_attempt + lockout_duration, check whether client-controllable inputs (e.g., a manipulated Date/X-Forwarded-Time header, or exploiting clock drift/NTP issues on the server) can influence the calculation. Also check for integer overflow/underflow in duration math.
+ Race condition on the counter: Fire concurrent failed attempts (parallel requests) right at the boundary — confirm the failed-attempt counter increments atomically and can't be raced past the threshold (e.g., 10 parallel requests all reading "4 failures" before any write completes).
+ Generic error message consistency: Confirm the exact same error string, HTTP status code, and response timing are returned whether the account is (a) locked with correct password, (b) locked with wrong password, (c) unlocked with wrong password. Diff every byte of the response, not just the visible message.
+ Lockout as a denial-of-service weapon: Confirm there's a distinction between throttling and full lockout, and that an attacker who intentionally fails login 5x against a known victim username can't trivially lock that victim out repeatedly (test: can lockout be triggered indefinitely back-to-back once the duration expires, becoming a persistent DoS against a specific user?).
+ IP+account combination logic: Test whether combining account + IP/device limiting has an OR/AND logic flaw — e.g., if only "IP AND account both must exceed threshold" is enforced, an attacker rotating IPs against one account, or hitting many accounts from one IP, may bypass lockout by design.
+ Notification tampering/bypass: Check if the lockout notification (email/SMS) can be suppressed — e.g., via mass account enumeration that triggers lockouts faster than notification delivery, or by triggering lockout via a channel that doesn't fire the alert (API vs. web form inconsistency).
+ CAPTCHA bypass: Test whether the CAPTCHA step (triggered after 3 failures) can be bypassed via automation — reused/replayed CAPTCHA tokens, CAPTCHA-solving services, missing CAPTCHA enforcement on alternate endpoints (mobile API, legacy endpoints), or client-side-only CAPTCHA validation.
+ Counter reset abuse: Check if any legitimate action (successful login, password reset request, account creation retry) resets the failed-attempt counter in a way that lets an attacker "launder" their attempt count mid-attack.
+
+3. CSRF Token
+
+ Token as brute-force control (anti-pattern check): Confirm CSRF token is not being relied upon as a rate-limiting or brute-force defense — test that removing/reusing a stale CSRF token doesn't bypass rate limits, since these are separate threat models and should have independent controls.
+ Token validation bypass: Test if the CSRF token check can be bypassed by omitting the token entirely, sending an empty string, sending a token from a different (attacker's own) session, or by exploiting endpoints that accept multiple content-types (some frameworks only validate CSRF on form-encoded bodies, not JSON).
+ Token predictability/reuse: Check if tokens are cryptographically random and unique per session/request, or if they're predictable, reused across sessions, or not properly invalidated after logout/password change.
+ Double-submit cookie flaw: If using double-submit cookie pattern, test whether an attacker who can set cookies on the victim's browser (e.g., via a subdomain XSS or cookie injection) can forge a matching token+cookie pair.
+ SameSite cookie bypass: Test with SameSite=Lax — confirm state-changing GET requests aren't exploitable (Lax still allows top-level navigation GETs). Check for older/non-compliant browsers where SameSite is ignored. Test subdomain-based attacks if cookies aren't also scoped with Secure/Host- prefixes.
+ Referrer/Origin header reliance: If CSRF defense also checks Origin/Referer as a fallback, test header stripping (some proxies/clients omit these) and confirm the app fails closed (rejects) rather than open when headers are missing.
+ Token refresh scope: If tokens refresh per sensitive action (synchronizer token pattern), test for race conditions where a token can be used twice before invalidation, or old tokens remaining valid after a new one is issued.
+
+4. User Enumeration
+
+ Response message differential: Diff exact error text, JSON error codes, and field-level validation messages across login, registration, and password-reset for both existing and non-existing accounts — including subtle differences like "email already registered" during signup, which is a very common enumeration leak.
+ Timing attack validation: Measure response time distributions (not just averages) across hundreds of requests for valid vs. invalid usernames — confirm the dummy hash computation actually matches the real computation's cost (same bcrypt cost factor/work factor), and that DB lookup time itself doesn't leak (e.g., indexed vs. non-indexed lookup timing differences before the dummy-hash step even runs).
+ HTTP status code / redirect diffing: Compare status codes (200 vs 302 vs 401 vs 404), redirect targets, and response headers (e.g., Set-Cookie presence) between valid/invalid username flows — any divergence is an enumeration vector.
+ Password reset flow enumeration: Confirm the "if this email is registered, a link was sent" message is used consistently, but also check for secondary leaks: different response times, different email content/absence for unregistered addresses (which reveals nothing was sent), or rate-limit differences (e.g., resend cooldown only applies to real accounts).
+ Registration flow enumeration: Test if "email already in use" errors during signup leak existence — consider whether an alternate flow (e.g., "check your email to complete registration" regardless of whether the email exists) is actually implemented, or if the direct error is still present.
+ Side-channel via account lockout: Cross-check with section 2 — if a locked account and a non-existent account behave identically, but a "just failed once" account has a subtly different response, that's still an enumeration leak.
+ API/mobile endpoint parity: Verify enumeration protections applied to the web login form are also applied to any API, mobile app, or legacy endpoint doing the same function — inconsistent protection across surfaces is common.
+
+5. Defense in Depth
+
+ MFA bypass paths: Test for MFA-skip endpoints (legacy login APIs, "remember this device" tokens that never expire or are forgeable, password-reset flows that grant a session without re-prompting MFA, OAuth/SSO fallback paths that don't enforce MFA).
+ MFA fatigue / push-bombing: If push-based MFA is used, test rate limiting on push notifications themselves (an attacker spamming approval requests hoping for accidental approval).
+ Anomaly detection evasion: Test whether "impossible travel" and credential-stuffing detection can be evaded via residential proxy pools, IP addresses geolocated near the victim, or slow-drip timing that stays under detection thresholds.
+ Logging integrity/coverage: Confirm logs capture failed and successful attempts with IP, user-agent, and timestamp on every auth-related endpoint (not just the main login form) — check for gaps in API, mobile, and SSO paths. Also test log injection (e.g., CRLF injection via username field into logs feeding a SIEM).
+ Breached password check bypass: Test whether the HaveIBeenPwned (or similar) check is enforced only client-side (bypassable by direct API calls), only at registration but not at password change, or fails open if the external API is unreachable.
+ New device/location trigger bypass: Test if device fingerprinting can be spoofed (user-agent spoofing, cookie/localStorage manipulation to fake a "known device" marker) to avoid triggering additional verification.
+ Verification email/SMS interception or bypass: For new-device verification challenges, test if the challenge can be skipped via API parameter manipulation, or if the verification code itself is brute-forceable (no rate limit on the code-entry step, which is a separate weak point from the login rate limiting itself).
